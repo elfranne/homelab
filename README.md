@@ -5,6 +5,12 @@ walkthrough; work through them in order.
 
 **Work in progress** — later steps are still being written.
 
+## Why?
+
+- **Encryption first** — home storage (NAS, homelab) too often handles data encryption poorly, or not at all; this build encrypts the ZFS root pool end to end.
+- **Learning** — hands-on with private-cloud technology and privacy.
+- **Hardware & AI** — running local AI models for coding.
+
 ## Hardware
 
 Built on a [Minisforum N5 Pro](https://www.minisforum.com/products/n5-pro) AI NAS:
