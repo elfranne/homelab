@@ -85,13 +85,25 @@ on_err() {
 trap on_err ERR
 
 # ---------- interaction ----------
-confirm() { # confirm "prompt"   -> 0 if yes
+confirm() { # confirm "prompt"   -> 0 if yes (used for genuinely optional yes/no choices)
   [[ "$ASSUME_YES" == "1" ]] && return 0
   local ans=""
   read -r -p "$1 [y/N] " ans </dev/tty || ans=""
   [[ "$ans" =~ ^[Yy]([Ee][Ss])?$ ]]
 }
-pause() { confirm "${1:-Proceed with this phase?}" || die "Aborted by user."; }
+require_yes() { # ask until the user answers yes; never returns non-zero — Ctrl-C to abort
+  [[ "$ASSUME_YES" == "1" ]] && return 0
+  local ans=""
+  while :; do
+    read -r -p "$1 [y/N] " ans </dev/tty || ans=""
+    [[ "$ans" =~ ^[Yy]([Ee][Ss])?$ ]] && return 0
+    warn "Not confirmed — type 'y' to proceed, or press Ctrl-C to abort."
+  done
+}
+pause() { # gate before a phase: wait for Enter (Ctrl-C to abort)
+  [[ "$ASSUME_YES" == "1" ]] && return 0
+  read -r -p "${1:-Press Enter to continue (Ctrl-C to abort)…}" _ </dev/tty || true
+}
 
 # ---------- helpers ----------
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"; }
@@ -218,7 +230,7 @@ run() {
   printf '  %-16s %s\n' "Admin user:"    "$ADMIN_USER"
   printf '  %-16s %s\n' "GPU profile:"   "${GPU_NODE:+$GPU_PROFILE ($GPU_NODE)}${GPU_NODE:-<no GPU node — skipped>}"
   printf '  %-16s %s\n' "NPU profile:"   "${NPU_NODE:+$NPU_PROFILE ($NPU_NODE)}${NPU_NODE:-<no NPU node — needs kernel >= 6.14, skipped>}"
-  confirm "Proceed with these settings?" || die "Not confirmed."
+  require_yes "Proceed with these settings?"
 
   # ---- Phase 1: install Incus ----
   phase 1 "Install Incus"

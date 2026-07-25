@@ -88,13 +88,25 @@ on_err() {
 trap on_err ERR
 
 # ---------- interaction ----------
-confirm() { # confirm "prompt"   -> 0 if yes
+confirm() { # confirm "prompt"   -> 0 if yes (used for genuinely optional yes/no choices)
   [[ "$ASSUME_YES" == "1" ]] && return 0
   local ans=""
   read -r -p "$1 [y/N] " ans </dev/tty || ans=""
   [[ "$ans" =~ ^[Yy]([Ee][Ss])?$ ]]
 }
-pause() { confirm "${1:-Proceed with this phase?}" || die "Aborted by user."; }
+require_yes() { # ask until the user answers yes; never returns non-zero — Ctrl-C to abort
+  [[ "$ASSUME_YES" == "1" ]] && return 0
+  local ans=""
+  while :; do
+    read -r -p "$1 [y/N] " ans </dev/tty || ans=""
+    [[ "$ans" =~ ^[Yy]([Ee][Ss])?$ ]] && return 0
+    warn "Not confirmed — type 'y' to proceed, or press Ctrl-C to abort."
+  done
+}
+pause() { # gate before a phase: wait for Enter (Ctrl-C to abort)
+  [[ "$ASSUME_YES" == "1" ]] && return 0
+  read -r -p "${1:-Press Enter to continue (Ctrl-C to abort)…}" _ </dev/tty || true
+}
 
 set_password() { # set_password USER — retry passwd instead of aborting the install on a typo
   local u="$1" tries=0
@@ -152,7 +164,7 @@ find_pubkey() { # discover an SSH *.pub in the current directory, confirm, set g
     [[ -n "$fp" ]] && echo "  fp  : $fp"
   fi
   echo
-  confirm "Authorize THIS key for remote unlock?" || die "Key not confirmed."
+  require_yes "Authorize THIS key for remote unlock?"
   SSH_PUBKEY="$key"
 }
 
@@ -231,7 +243,7 @@ select_disks() { # list detected disks, let the user pick (>=3), confirm; set gl
     printf '   - %-16s %s\n' "$d" "$(lsblk -dpno SIZE,MODEL "$d" 2>/dev/null | sed 's/  */ /g; s/^ //')"
   done
   echo
-  confirm "Use these $n disks?" || die "Disk selection not confirmed."
+  require_yes "Use these $n disks?"
   DISKS=("${picks[@]}")
 }
 
@@ -318,8 +330,7 @@ select_iface() { # list NICs, prefer one with an active link, confirm; sets glob
   fi
   [[ -n "$sel" && -d "/sys/class/net/$sel" ]] || die "Unknown interface: '${input:-<empty>}'"
 
-  confirm "Use interface '$sel' for ZFSBootMenu remote-unlock networking?" \
-    || die "Interface selection not confirmed."
+  require_yes "Use interface '$sel' for ZFSBootMenu remote-unlock networking?"
   NET_IFACE="$sel"
   # Record the MAC so downstream config can match the NIC by hardware address
   # instead of by name — interface names can differ between the live ISO, the
@@ -373,7 +384,7 @@ prompt_network() { # interactively collect the static IP config for NET_IFACE; s
   echo "  IP:      $ip"
   echo "  Gateway: $gw"
   echo "  Netmask: $mask"
-  confirm "Use this static network config for remote unlock?" || die "Network config not confirmed."
+  require_yes "Use this static network config for remote unlock?"
   NET_IP="$ip"; NET_GW="$gw"; NET_MASK="$mask"
 }
 
@@ -482,7 +493,7 @@ prompt_config() { # Stage 1: review the tunable settings, using the CONFIG-block
   printf '  %-16s %s\n' "Dropbear port:" "$DROPBEAR_PORT"
   printf '  %-16s %s\n' "ZBM version:" "$ZBM_VERSION"
   printf '  %-16s %s\n' "crypt-ssh:"   "$CRYPT_SSH_COMMIT"
-  confirm "Proceed with these settings?" || die "Configuration not confirmed."
+  require_yes "Proceed with these settings?"
 }
 
 load_state() { # Stage 2: recover identity + network config + disk list recorded by Stage 1
