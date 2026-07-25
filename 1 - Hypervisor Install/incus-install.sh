@@ -116,7 +116,8 @@ profile_has_device() { # profile_has_device PROFILE DEV -> 0 if PROFILE already 
 }
 first_render_node() { # print the first /dev/dri/renderD* node, or nothing
   local n
-  for n in /dev/dri/renderD*; do [[ -e "$n" ]] && { printf '%s' "$n"; return; }; done
+  for n in /dev/dri/renderD*; do [[ -e "$n" ]] && { printf '%s' "$n"; return 0; }; done
+  return 0   # no node (glob stayed literal) — succeed printing nothing, don't trip set -e
 }
 kernel_ge_614() { # 0 if the running kernel is >= 6.14 (where amdxdna is mainlined)
   local mm maj min
