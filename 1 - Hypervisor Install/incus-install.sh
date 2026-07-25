@@ -21,9 +21,15 @@
 #   editing them is optional.
 #
 # This adds packages and one ZFS dataset; it does not wipe disks or change the
-# host's network config. The optional NPU phase (SETUP_NPU_KERNEL, default off) can
-# additionally pull a newer kernel + ZFS from trixie-backports; it verifies the result
-# and never reboots.
+# host's network config.
+#
+# GPU/NPU DRIVERS FIRST: if the GPU render node (/dev/dri/renderD*) or the XDNA NPU
+# (/dev/accel/accel0) is missing, an early phase — BEFORE Incus is installed — offers
+# to enable trixie-backports and install firmware-amd-graphics (and, when the NPU is
+# missing on an < 6.14 kernel, a newer verified kernel + ZFS too). Because those need
+# a reboot to take effect, that phase then STOPS (it never reboots): reboot, then
+# re-run this idempotent script and it detects the accelerators and finishes the whole
+# install — Incus, storage, networks, and the gpu/npu profiles — in one pass.
 #
 set -Eeuo pipefail
 
@@ -53,11 +59,14 @@ GPU_PROFILE="gpu"              # add-on profile: /dev/dri render node (container
 NPU_PROFILE="npu"              # add-on profile: /dev/accel/accel0 (AMD XDNA NPU, needs kernel >= 6.14)
 
 # The AMD XDNA NPU driver (amdxdna) needs Linux >= 6.14, but Trixie ships 6.12. When
-# enabled AND the NPU is absent on an < 6.14 kernel, the final phase pulls a newer
-# kernel + matching ZFS from trixie-backports (one apt transaction), verifies the ZFS
-# DKMS build / initramfs key / rebuilt ZFSBootMenu image, and then STOPS — it does not
-# reboot. Default off; opt in with e.g.  sudo SETUP_NPU_KERNEL=ask ./incus-install.sh
-SETUP_NPU_KERNEL="${SETUP_NPU_KERNEL:-no}"   # no | ask | yes
+# the NPU is absent on an < 6.14 kernel and you confirm the early driver phase, the
+# script pulls a newer kernel + matching ZFS from trixie-backports (one apt
+# transaction), verifies the ZFS DKMS build / initramfs key / rebuilt ZFSBootMenu
+# image, pins the kernel minor series, and then STOPS (it never reboots). This knob is
+# a non-interactive safety override on the KERNEL step only: 'yes' (default) allows the
+# kernel when the NPU needs it; 'no' stays firmware-only and never touches the
+# kernel/ZFS/ZBM (the NPU then stays disabled).
+SETUP_NPU_KERNEL="${SETUP_NPU_KERNEL:-yes}"  # yes | no
 
 # Admin user to grant Incus control (added to the incus-admin group). Auto-detected
 # from $SUDO_USER when possible; prompted otherwise.
@@ -160,6 +169,91 @@ prompt_admin_user() { # set ADMIN_USER to a real, non-root account (default from
   ADMIN_USER="$u"
 }
 
+enable_backports() { # enable trixie-backports (idempotent), matching step 0's source components
+  local bp=/etc/apt/sources.list.d/backports.list
+  if ! grep -rqsE '^\s*deb\s.*trixie-backports' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
+    echo 'deb http://deb.debian.org/debian trixie-backports main contrib non-free-firmware' > "$bp"
+    ok "Enabled trixie-backports ($bp)."
+  else
+    log "trixie-backports already enabled."
+  fi
+}
+
+install_backports_kernel_verified() { # pull + verify a backports kernel/ZFS/firmware; sets KERNEL_UPGRADED/KERNEL_SERIES
+  local oldk newk initrd zbm_img zbm_contents pin
+  oldk="$(uname -r)"
+  # Kernel + matching ZFS + initramfs + firmware, all from backports in ONE
+  # transaction, so DKMS builds zfs against the new kernel (a kernel newer than the
+  # installed ZFS supports would otherwise fail to build and leave root unbootable).
+  # The step-0 pre-apt hook snapshots root first; the kernel postinst hook rebuilds
+  # ZFSBootMenu (rotating the last-good image to VMLINUZ-BACKUP.EFI). We do NOT run
+  # generate-zbm ourselves — that would clobber that backup with an untested image.
+  DEBIAN_FRONTEND=noninteractive apt -t trixie-backports install -y \
+    linux-image-amd64 linux-headers-amd64 zfs-dkms zfsutils-linux zfs-initramfs firmware-amd-graphics
+
+  # ---- verify the new kernel BEFORE any reboot ----
+  newk="$(printf '%s\n' /lib/modules/*/ | sed 's#/lib/modules/##; s#/##' | sort -V | tail -1)"
+  [[ -n "$newk" ]] || die "Could not determine the newly installed kernel version."
+  if [[ "$newk" == "$oldk" ]]; then
+    warn "Backports did not provide a kernel newer than $oldk — nothing to enable. Skipping."
+    return 0
+  fi
+  log "New kernel: $newk (was $oldk). Verifying before you reboot…"
+  modinfo -k "$newk" zfs >/dev/null 2>&1 \
+    || die "ZFS module did NOT build for $newk (check 'dkms status'). DO NOT reboot into $newk — boot the previous kernel from the ZFSBootMenu menu, or roll back the pre-apt 'apt_*' snapshot."
+  # Rebuild the new kernel's initramfs explicitly. In the single apt transaction the
+  # kernel's postinst can generate the initramfs BEFORE the (backports) zfs-initramfs
+  # hook is configured, leaving the zfs module and the encryption key out of it. Now
+  # that zfs-dkms is confirmed built, rebuild so the module + /etc/zfs/zroot.key are
+  # baked in — otherwise the new kernel can't unlock root.
+  update-initramfs -u -k "$newk" \
+    || die "Could not rebuild the initramfs for $newk (update-initramfs failed) — DO NOT reboot; investigate before continuing."
+  initrd="/boot/initrd.img-$newk"
+  [[ -f "$initrd" ]] || die "No initramfs for $newk at $initrd."
+  lsinitramfs "$initrd" 2>/dev/null | grep -q "etc/zfs/zroot.key" \
+    || die "Encryption key is NOT in the $newk initramfs even after a rebuild — the new kernel could not unlock root. DO NOT reboot; investigate zfs-initramfs (check '/etc/zfs/zroot.key' and 'zfs get keylocation') before continuing."
+  # ZFSBootMenu image the postinst hook rebuilt against the new kernel.
+  zbm_img="/boot/efi/EFI/zbm/VMLINUZ.EFI"
+  [[ -f "$zbm_img" ]] || die "ZFSBootMenu image missing at $zbm_img after the kernel install — DO NOT reboot; use the 'ZFSBootMenu Backup' EFI entry and investigate generate-zbm."
+  zbm_contents="$(lsinitrd "$zbm_img" 2>/dev/null || true)"
+  grep -q zfs <<<"$zbm_contents" \
+    || die "Rebuilt ZFSBootMenu image has no zfs module — it could not import the pool. DO NOT reboot; boot the 'ZFSBootMenu Backup' EFI entry and investigate."
+  if grep -q dropbear <<<"$zbm_contents"; then
+    ok "ZFSBootMenu rebuilt with zfs + dropbear (remote unlock intact)."
+  else
+    warn "Rebuilt ZFSBootMenu image has no dropbear — remote unlock may be unavailable; console unlock still works. Verify at first boot."
+  fi
+  KERNEL_UPGRADED=1
+  ok "Kernel $newk installed and verified (ZFS built, key in initramfs, ZBM rebuilt). Not rebooting."
+
+  # Pin the kernel to THIS minor series so it can't outpace OpenZFS. ZFS is a DKMS
+  # module and OpenZFS caps support at a kernel MINOR: every X.Y.z builds, but X.(Y+1)
+  # may not. Pinning the meta-packages to the verified series lets point/ABI updates
+  # (security fixes) install while holding back the next minor.
+  KERNEL_SERIES="$(grep -oE '^[0-9]+\.[0-9]+' <<<"$newk" || true)"
+  if [[ -n "$KERNEL_SERIES" ]]; then
+    pin=/etc/apt/preferences.d/90-zfs-kernel-series
+    cat > "$pin" <<EOF
+# Keep the kernel on the ${KERNEL_SERIES}.x series so it can't outpace OpenZFS (ZFS is a
+# DKMS module; OpenZFS caps support at a kernel MINOR). ${KERNEL_SERIES}.x point/ABI
+# updates still install (security fixes); the next minor is held back. To move to a
+# newer series later: confirm trixie-backports zfs-dkms supports it, then bump the
+# version below (and re-verify the ZFS DKMS build before rebooting) or remove this file.
+Package: linux-image-amd64 linux-headers-amd64
+Pin: version ${KERNEL_SERIES}.*
+Pin-Priority: 1001
+EOF
+    if grep -q "Pin: version ${KERNEL_SERIES}\\.\\*" "$pin" 2>/dev/null; then
+      ok "Kernel pinned to the ${KERNEL_SERIES}.x series ($pin) — ${KERNEL_SERIES}.x updates flow, newer minors are held back."
+    else
+      warn "Could not confirm the kernel series pin in $pin — check it by hand (apt-cache policy linux-image-amd64)."
+    fi
+  else
+    warn "Could not derive a minor series from '$newk' — kernel not pinned. Consider 'apt-mark hold linux-image-amd64' to stop it drifting past ZFS support."
+  fi
+  return 0
+}
+
 # =====================================================================================
 run() {
   echo "${BLD}Incus hypervisor installer — Debian Trixie on root-on-ZFS${RST}"
@@ -190,19 +284,20 @@ run() {
   fi
 
   # Accelerators (N5 Pro: Radeon 890M iGPU + XDNA2 NPU). Detect the device nodes so the
-  # summary reports what container passthrough profiles Phase 4 can create. Non-fatal.
+  # summary reports what's available and Phase 1 can offer to enable missing drivers
+  # (backports + firmware, before Incus). Non-fatal.
   GPU_NODE=""; NPU_NODE=""
   GPU_NODE="$(first_render_node)"
   if [[ -n "$GPU_NODE" ]]; then
     ok "GPU render node present ($GPU_NODE) — amdgpu is up; container VAAPI transcoding available."
   else
-    warn "No /dev/dri/renderD* node — amdgpu/firmware not ready. Phase 4 will (re)install GPU firmware; a reboot may be needed."
+    warn "No /dev/dri/renderD* node — amdgpu/firmware not ready. Phase 1 will offer to install GPU firmware from backports; a reboot may be needed."
   fi
   if [[ -e /dev/accel/accel0 ]]; then
     NPU_NODE="/dev/accel/accel0"
     ok "NPU present ($NPU_NODE) — amdxdna driver loaded."
   else
-    warn "No /dev/accel/accel0 — the AMD XDNA NPU needs Linux >= 6.14 (Trixie ships $(uname -r)). See INSTALL.md for the backports-kernel path; the NPU profile will be skipped."
+    warn "No /dev/accel/accel0 — the AMD XDNA NPU needs Linux >= 6.14 (Trixie ships $(uname -r)). Phase 1 will offer the backports kernel; the NPU profile is skipped until then."
   fi
 
   # macvlan parent for the LAN profile = the interface carrying the default route.
@@ -233,8 +328,91 @@ run() {
   printf '  %-16s %s\n' "NPU profile:"   "${NPU_NODE:+$NPU_PROFILE ($NPU_NODE)}${NPU_NODE:-<no NPU node — needs kernel >= 6.14, skipped>}"
   require_yes "Proceed with these settings?"
 
-  # ---- Phase 1: install Incus ----
-  phase 1 "Install Incus"
+  # ---- Phase 1: enable GPU/NPU drivers (backports + firmware), BEFORE Incus ----
+  phase 1 "Enable GPU/NPU drivers (backports + firmware)"
+  KERNEL_UPGRADED=0; KERNEL_SERIES=""; FIRMWARE_INSTALLED=0
+  local gpu_missing=0 npu_missing=0 npu_needs_kernel=0
+  [[ -z "$GPU_NODE" ]] && gpu_missing=1
+  [[ -z "$NPU_NODE" ]] && npu_missing=1
+  # The NPU wants Linux >= 6.14; a backports kernel is only fixable if we're allowed to
+  # touch it (SETUP_NPU_KERNEL=no is a hard opt-out that keeps this firmware-only).
+  if (( npu_missing )) && ! kernel_ge_614 && [[ "$SETUP_NPU_KERNEL" != "no" ]]; then
+    npu_needs_kernel=1
+  fi
+  if (( npu_missing )) && kernel_ge_614; then
+    warn "NPU node absent but the kernel is $(uname -r) (>= 6.14) — a firmware/driver issue, not a kernel-version one. See INSTALL.md; not touching the kernel."
+  fi
+
+  if (( gpu_missing || npu_needs_kernel )); then
+    local do_drivers=0
+    echo "Missing accelerator device node(s):"
+    (( gpu_missing ))      && echo "  - GPU render node (/dev/dri/renderD*) — needs firmware-amd-graphics."
+    (( npu_needs_kernel )) && echo "  - XDNA NPU (/dev/accel/accel0) — needs Linux >= 6.14 (this box: $(uname -r))."
+    echo "This enables trixie-backports and installs the driver(s) above, then STOPS so you"
+    echo "can reboot (it never reboots for you). After reboot, re-run this script and it"
+    echo "detects the accelerators and finishes the whole install (Incus + profiles) in one pass."
+    if (( npu_needs_kernel )); then
+      echo "${YLW}It will also install a newer KERNEL + ZFS from backports and rebuild ZFSBootMenu."
+      echo "If the ZFS DKMS build failed the box could be unbootable — recovery is the"
+      echo "'ZFSBootMenu Backup' EFI entry / the pre-apt ZFS snapshot (see INSTALL.md). This is"
+      echo "verified before you reboot.${RST}"
+    fi
+    case "$SETUP_ACCEL" in
+      yes) do_drivers=1 ;;
+      no)  do_drivers=0 ;;
+      *)   confirm "Enable trixie-backports and install these driver(s) now?" && do_drivers=1 ;;
+    esac
+
+    if (( do_drivers )); then
+      enable_backports
+      apt update
+      if (( npu_needs_kernel )); then
+        # Verified transaction also installs firmware-amd-graphics, so it fixes the GPU too.
+        install_backports_kernel_verified
+      elif (( gpu_missing )); then
+        # GPU firmware only — from backports (likelier to carry the Radeon 890M blobs).
+        if DEBIAN_FRONTEND=noninteractive apt -t trixie-backports install -y firmware-amd-graphics; then
+          FIRMWARE_INSTALLED=1
+        else
+          warn "Could not install firmware-amd-graphics from backports — install it by hand if the GPU node stays missing."
+        fi
+      fi
+
+      if (( KERNEL_UPGRADED )); then
+        echo
+        echo "${BLD}${YLW}Driver kernel installed — action required (Incus NOT yet installed):${RST}"
+        echo "  a. REBOOT. ZFSBootMenu will ask for the ZFS passphrase (console, or dropbear"
+        echo "     remote unlock) — it boots the new kernel by default. If it won't boot, pick"
+        echo "     the previous kernel in the ZBM menu, or the 'ZFSBootMenu Backup' EFI entry."
+        echo "  b. After boot, confirm:  uname -r   lsmod | grep amdxdna   ls -l /dev/accel/accel0"
+        (( gpu_missing )) && echo "                     and, for the GPU:  ls -l /dev/dri/renderD*"
+        echo "  c. Re-run this script (it's idempotent) — it will detect the accelerators and"
+        echo "     install Incus + create the gpu/npu profiles."
+        if [[ -n "$KERNEL_SERIES" ]]; then
+          echo "  -  Kernel pinned to the ${KERNEL_SERIES}.x series via /etc/apt/preferences.d/90-zfs-kernel-series"
+          echo "     (${KERNEL_SERIES}.x updates flow; newer minors held back until you move deliberately)."
+        fi
+        exit 0
+      elif (( FIRMWARE_INSTALLED )); then
+        echo
+        echo "${BLD}${YLW}GPU firmware installed — action required (Incus NOT yet installed):${RST}"
+        echo "  a. REBOOT so amdgpu can load the new firmware and create the render node."
+        echo "  b. After boot, confirm:  ls -l /dev/dri/renderD*"
+        echo "  c. Re-run this script (it's idempotent) — it will detect the GPU and install"
+        echo "     Incus + create the '${GPU_PROFILE}' profile."
+        exit 0
+      else
+        warn "No driver package was installed (nothing newer available?) — continuing to the Incus install without the accelerators."
+      fi
+    else
+      warn "Driver enablement skipped — continuing without GPU/NPU. The gpu/npu profiles will be skipped."
+    fi
+  else
+    log "GPU/NPU device nodes present (or nothing backports can fix) — no driver enablement needed."
+  fi
+
+  # ---- Phase 2: install Incus ----
+  phase 2 "Install Incus"
   pause
   apt update
   # Default 'apt install' pulls Recommends, which include qemu-system-x86/OVMF for VMs.
@@ -245,8 +423,8 @@ run() {
   incus info >/dev/null 2>&1 || die "Incus daemon is not responding ('incus info' failed)."
   ok "Incus installed and the daemon is responding."
 
-  # ---- Phase 2: ZFS dataset for Incus ----
-  phase 2 "Create the ZFS dataset for Incus"
+  # ---- Phase 3: ZFS dataset for Incus ----
+  phase 3 "Create the ZFS dataset for Incus"
   if ! zfs list -H -o name "$POOL/$INCUS_DATASET" >/dev/null 2>&1; then
     # mountpoint=none: Incus manages the mountpoints of the child datasets it creates.
     zfs create -o mountpoint=none "$POOL/$INCUS_DATASET"
@@ -260,8 +438,8 @@ run() {
     warn "Dataset '$POOL/$INCUS_DATASET' ready but encryption is '$enc' — the pool is not encrypted?"
   fi
 
-  # ---- Phase 3: initialise Incus (preseed) ----
-  phase 3 "Initialise Incus (storage + networks + profiles)"
+  # ---- Phase 4: initialise Incus (preseed) ----
+  phase 4 "Initialise Incus (storage + networks + profiles)"
   pause
   # Idempotent: 'incus admin init --preseed' creates what's missing and merges the
   # rest, so this is safe to re-run. The 'lan' profile is self-contained (its own root
@@ -315,11 +493,13 @@ EOF
     || die "Profile '$LAN_PROFILE' missing after init."
   ok "Storage '$STORAGE_POOL' (zfs), network '$BRIDGE_NAME' (NAT), profiles 'default' + '$LAN_PROFILE' ready."
 
-  # ---- Phase 4: GPU / NPU accelerator profiles ----
-  phase 4 "GPU / NPU accelerator profiles (containers)"
+  # ---- Phase 5: GPU / NPU accelerator profiles ----
+  phase 5 "GPU / NPU accelerator profiles (containers)"
   # These are add-on profiles (device only, no root/nic) — stack them onto default/lan.
   # Container-only by design: a 'gpu' device in a VM PCI-passes the iGPU away from the
-  # host, which isn't viable for the single integrated GPU (see INSTALL.md).
+  # host, which isn't viable for the single integrated GPU (see INSTALL.md). Drivers
+  # were already offered up front in Phase 1, so here we only create profiles for the
+  # nodes that are actually present.
   local do_accel=0
   case "$SETUP_ACCEL" in
     yes) do_accel=1 ;;
@@ -327,10 +507,7 @@ EOF
     *)   confirm "Create GPU/NPU passthrough profiles for containers?" && do_accel=1 ;;
   esac
   if (( do_accel )); then
-    # GPU firmware for the Radeon 890M (step 0 enabled non-free-firmware in apt sources).
-    DEBIAN_FRONTEND=noninteractive apt install -y firmware-amd-graphics \
-      || warn "Could not install firmware-amd-graphics — install it by hand if the GPU node stays missing."
-    # Re-check in case the node appeared since preflight.
+    # Re-check in case a node appeared since preflight.
     [[ -z "$GPU_NODE" ]] && GPU_NODE="$(first_render_node)"
 
     # GPU: a 'physical' gpu device gives the container the /dev/dri render node (VAAPI).
@@ -341,7 +518,7 @@ EOF
       profile_has_device "$GPU_PROFILE" gpu || die "Failed to add gpu device to profile '$GPU_PROFILE'."
       ok "GPU profile '$GPU_PROFILE' ready — e.g. incus launch images:debian/13 c1 -p default -p $GPU_PROFILE"
     else
-      warn "GPU render node still absent — '$GPU_PROFILE' profile skipped. Reboot after the firmware install, then re-run to create it."
+      warn "GPU render node still absent — '$GPU_PROFILE' profile skipped. Re-run this script (Phase 1 can install GPU firmware from backports; reboot, then re-run) to create it."
     fi
 
     # NPU: no native Incus device type — pass /dev/accel/accel0 as a unix-char device.
@@ -352,14 +529,14 @@ EOF
       profile_has_device "$NPU_PROFILE" npu || die "Failed to add npu device to profile '$NPU_PROFILE'."
       ok "NPU profile '$NPU_PROFILE' ready — e.g. incus launch images:debian/13 c1 -p default -p $NPU_PROFILE"
     else
-      warn "NPU node absent (needs Linux >= 6.14; Trixie ships $(uname -r)) — '$NPU_PROFILE' profile skipped. See INSTALL.md for the backports-kernel path, then re-run."
+      warn "NPU node absent (needs Linux >= 6.14; Trixie ships $(uname -r)) — '$NPU_PROFILE' profile skipped. Re-run this script (Phase 1 offers the backports kernel; reboot, then re-run) to create it."
     fi
   else
     log "GPU/NPU profile setup skipped."
   fi
 
-  # ---- Phase 5: local admin access ----
-  phase 5 "Grant '$ADMIN_USER' local Incus control"
+  # ---- Phase 6: local admin access ----
+  phase 6 "Grant '$ADMIN_USER' local Incus control"
   getent group incus-admin >/dev/null 2>&1 || die "Group 'incus-admin' does not exist (incus package problem?)."
   usermod -aG incus-admin "$ADMIN_USER"
   id -nG "$ADMIN_USER" | tr ' ' '\n' | grep -qx incus-admin \
@@ -367,8 +544,8 @@ EOF
   ok "'$ADMIN_USER' added to incus-admin (local unix-socket access; no remote TLS port opened)."
   warn "'$ADMIN_USER' must log out and back in for the new group to take effect."
 
-  # ---- Phase 6: optional smoke test ----
-  phase 6 "Smoke test (optional)"
+  # ---- Phase 7: optional smoke test ----
+  phase 7 "Smoke test (optional)"
   local do_test=0
   case "$RUN_SMOKE_TEST" in
     yes) do_test=1 ;;
@@ -395,105 +572,6 @@ EOF
     log "Smoke test skipped."
   fi
 
-  # ---- Phase 7: optional NPU-enabling kernel upgrade (backports) ----
-  phase 7 "Enable the NPU: newer kernel from backports (optional)"
-  KERNEL_UPGRADED=0; KERNEL_SERIES=""
-  if [[ -n "$NPU_NODE" ]]; then
-    log "NPU already present ($NPU_NODE) — nothing to do."
-  elif kernel_ge_614; then
-    warn "Running kernel is $(uname -r) (>= 6.14) but /dev/accel/accel0 is absent — this is a firmware/driver issue, not a kernel-version one. See INSTALL.md; not touching the kernel."
-  else
-    local do_kernel=0
-    case "$SETUP_NPU_KERNEL" in
-      yes) do_kernel=1 ;;
-      no)  do_kernel=0 ;;
-      *)   # ask
-        echo "${YLW}The AMD XDNA NPU needs Linux >= 6.14; this box runs $(uname -r).${RST}"
-        echo "Proceeding upgrades the KERNEL + ZFS (from trixie-backports) in one step and"
-        echo "rebuilds ZFSBootMenu. It does NOT reboot. If the ZFS DKMS build failed the box"
-        echo "could be unbootable — recovery is the 'ZFSBootMenu Backup' EFI entry / the"
-        echo "pre-apt ZFS snapshot (see INSTALL.md). This is verified before you reboot."
-        confirm "Pull a backports kernel now to enable the NPU?" && do_kernel=1 ;;
-    esac
-    if (( do_kernel )); then
-      # Enable trixie-backports (idempotent), matching step 0's source components.
-      local bp=/etc/apt/sources.list.d/backports.list
-      if ! grep -rqsE '^\s*deb\s.*trixie-backports' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
-        echo 'deb http://deb.debian.org/debian trixie-backports main contrib non-free-firmware' > "$bp"
-        ok "Enabled trixie-backports ($bp)."
-      else
-        log "trixie-backports already enabled."
-      fi
-      apt update
-      local oldk; oldk="$(uname -r)"
-      # Kernel + matching ZFS + initramfs + firmware, all from backports in ONE
-      # transaction, so DKMS builds zfs against the new kernel (a kernel newer than the
-      # installed ZFS supports would otherwise fail to build and leave root unbootable).
-      # The step-0 pre-apt hook snapshots root first; the kernel postinst hook rebuilds
-      # ZFSBootMenu (rotating the last-good image to VMLINUZ-BACKUP.EFI). We do NOT run
-      # generate-zbm ourselves — that would clobber that backup with an untested image.
-      DEBIAN_FRONTEND=noninteractive apt -t trixie-backports install -y \
-        linux-image-amd64 linux-headers-amd64 zfs-dkms zfsutils-linux zfs-initramfs firmware-amd-graphics
-
-      # ---- verify the new kernel BEFORE any reboot ----
-      local newk
-      newk="$(printf '%s\n' /lib/modules/*/ | sed 's#/lib/modules/##; s#/##' | sort -V | tail -1)"
-      [[ -n "$newk" ]] || die "Could not determine the newly installed kernel version."
-      if [[ "$newk" == "$oldk" ]]; then
-        warn "Backports did not provide a kernel newer than $oldk — nothing to enable. Skipping."
-      else
-        log "New kernel: $newk (was $oldk). Verifying before you reboot…"
-        modinfo -k "$newk" zfs >/dev/null 2>&1 \
-          || die "ZFS module did NOT build for $newk (check 'dkms status'). DO NOT reboot into $newk — boot the previous kernel from the ZFSBootMenu menu, or roll back the pre-apt 'apt_*' snapshot."
-        local initrd="/boot/initrd.img-$newk"
-        [[ -f "$initrd" ]] || die "No initramfs for $newk at $initrd."
-        lsinitramfs "$initrd" 2>/dev/null | grep -q "etc/zfs/zroot.key" \
-          || die "Encryption key is NOT in the $newk initramfs — the new kernel could not unlock root. DO NOT reboot; investigate zfs-initramfs before continuing."
-        # ZFSBootMenu image the postinst hook rebuilt against the new kernel.
-        local zbm_img="/boot/efi/EFI/zbm/VMLINUZ.EFI" zbm_contents=""
-        [[ -f "$zbm_img" ]] || die "ZFSBootMenu image missing at $zbm_img after the kernel install — DO NOT reboot; use the 'ZFSBootMenu Backup' EFI entry and investigate generate-zbm."
-        zbm_contents="$(lsinitrd "$zbm_img" 2>/dev/null || true)"
-        grep -q zfs <<<"$zbm_contents" \
-          || die "Rebuilt ZFSBootMenu image has no zfs module — it could not import the pool. DO NOT reboot; boot the 'ZFSBootMenu Backup' EFI entry and investigate."
-        if grep -q dropbear <<<"$zbm_contents"; then
-          ok "ZFSBootMenu rebuilt with zfs + dropbear (remote unlock intact)."
-        else
-          warn "Rebuilt ZFSBootMenu image has no dropbear — remote unlock may be unavailable; console unlock still works. Verify at first boot."
-        fi
-        KERNEL_UPGRADED=1
-        ok "Kernel $newk installed and verified (ZFS built, key in initramfs, ZBM rebuilt). Not rebooting."
-
-        # Pin the kernel to THIS minor series so it can't outpace OpenZFS. ZFS is a
-        # DKMS module and OpenZFS caps support at a kernel MINOR: every X.Y.z builds,
-        # but X.(Y+1) may not. Pinning the meta-packages to the verified series lets
-        # point/ABI updates (security fixes) install while holding back the next minor.
-        KERNEL_SERIES="$(grep -oE '^[0-9]+\.[0-9]+' <<<"$newk" || true)"
-        if [[ -n "$KERNEL_SERIES" ]]; then
-          local pin=/etc/apt/preferences.d/90-zfs-kernel-series
-          cat > "$pin" <<EOF
-# Keep the kernel on the ${KERNEL_SERIES}.x series so it can't outpace OpenZFS (ZFS is a
-# DKMS module; OpenZFS caps support at a kernel MINOR). ${KERNEL_SERIES}.x point/ABI
-# updates still install (security fixes); the next minor is held back. To move to a
-# newer series later: confirm trixie-backports zfs-dkms supports it, then bump the
-# version below (and re-verify the ZFS DKMS build before rebooting) or remove this file.
-Package: linux-image-amd64 linux-headers-amd64
-Pin: version ${KERNEL_SERIES}.*
-Pin-Priority: 1001
-EOF
-          if grep -q "Pin: version ${KERNEL_SERIES}\\.\\*" "$pin" 2>/dev/null; then
-            ok "Kernel pinned to the ${KERNEL_SERIES}.x series ($pin) — ${KERNEL_SERIES}.x updates flow, newer minors are held back."
-          else
-            warn "Could not confirm the kernel series pin in $pin — check it by hand (apt-cache policy linux-image-amd64)."
-          fi
-        else
-          warn "Could not derive a minor series from '$newk' — kernel not pinned. Consider 'apt-mark hold linux-image-amd64' to stop it drifting past ZFS support."
-        fi
-      fi
-    else
-      log "Backports kernel upgrade skipped (SETUP_NPU_KERNEL=$SETUP_NPU_KERNEL). See INSTALL.md to enable the NPU later."
-    fi
-  fi
-
   # ---- finish ----
   echo
   ok "Incus hypervisor layer installed."
@@ -515,19 +593,6 @@ EOF
   fi
   echo "  -  Incus data lives on ZFS at:    ${POOL}/${INCUS_DATASET}"
   echo "  -  GPU/NPU in a VM needs VFIO passthrough — see INSTALL.md (advanced)."
-  if (( KERNEL_UPGRADED )); then
-    echo
-    echo "${BLD}${YLW}NPU kernel installed — action required:${RST}"
-    echo "  a. REBOOT. ZFSBootMenu will ask for the ZFS passphrase (console, or dropbear"
-    echo "     remote unlock) — it boots the new kernel by default. If it won't boot, pick"
-    echo "     the previous kernel in the ZBM menu, or the 'ZFSBootMenu Backup' EFI entry."
-    echo "  b. After boot, confirm:  uname -r   lsmod | grep amdxdna   ls -l /dev/accel/accel0"
-    echo "  c. Re-run this script (it's idempotent) to create the '${NPU_PROFILE}' profile."
-    if [[ -n "$KERNEL_SERIES" ]]; then
-      echo "  -  Kernel pinned to the ${KERNEL_SERIES}.x series via /etc/apt/preferences.d/90-zfs-kernel-series"
-      echo "     (${KERNEL_SERIES}.x updates flow; newer minors held back until you move deliberately)."
-    fi
-  fi
 }
 
 usage() {
