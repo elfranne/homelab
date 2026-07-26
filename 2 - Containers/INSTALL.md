@@ -168,6 +168,34 @@ Quick check from a LAN machine:
 curl -I https://cloud.<domain>     # 200/302 with a valid Let's Encrypt cert — no -k needed
 ```
 
+## Image definitions (one YAML per image)
+
+The two scripts above provision *running* containers imperatively. As the homelab grows,
+the better pattern is to bake each service's OS + packages + static config into a
+**reproducible `distrobuilder` image** and keep only the stateful setup as a thin step.
+This folder is where those **image definitions** live — **one YAML file per image** —
+sitting beside the service they build.
+
+- [`example.yaml`](example.yaml) — a worked example: a minimal Debian 13 + nginx image
+  with a baked landing page and a rootfs version marker. It's the reference for the
+  create → deploy → update → destroy lifecycle.
+- Real services are added the same way over time (e.g. `nextcloud.yaml`, `proxy.yaml`),
+  each its own file here.
+
+The **generic build/deploy/update/destroy machinery is not in this folder** — it belongs
+to the hypervisor layer. Build and manage any image here with `image.sh` from step 1:
+
+```sh
+"../1 - Hypervisor Install/image.sh" build   example.yaml
+"../1 - Hypervisor Install/image.sh" deploy  example demo --volume default/demo-data:/srv/data
+"../1 - Hypervisor Install/image.sh" update  example demo      # after editing the YAML
+"../1 - Hypervisor Install/image.sh" destroy demo --image example --volume default/demo-data
+```
+
+See [**Building images with distrobuilder**](<../1 - Hypervisor Install/INSTALL.md#building-images-with-distrobuilder>)
+in the hypervisor step for the full procedure, the build-root-vs-unprivileged-runtime
+explanation, and the image-vs-volume split.
+
 ## Adding more services later (the recipe)
 
 Every future service is the same pattern behind the same proxy:

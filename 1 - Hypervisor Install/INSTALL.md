@@ -349,6 +349,71 @@ on this platform is fragile. For the built-in devices, **prefer containers.** VF
 a VM makes sense mainly if you add a **discrete GPU** in the PCIe x16 slot — then the
 iGPU stays with the host/containers and the dGPU goes to the VM.
 
+## Building images with distrobuilder
+
+The steps above provision containers *imperatively* — launch a stock image, then
+`apt install` at runtime. For services you run for real, it's better to bake the OS +
+packages + static config into a **reproducible, versioned Incus image** with
+[`distrobuilder`](https://github.com/lxc/distrobuilder), and keep only the stateful,
+secret-bearing bits as a thin provisioning step. That building/running machinery lives
+here, in the hypervisor layer, because it's generic; each **image definition** is one
+YAML file kept next to its service in [`../2 - Containers/`](<../2 - Containers/INSTALL.md>).
+
+**Build needs root; the container still runs unprivileged.** `distrobuilder` needs host
+root at *build time only* (it does `debootstrap`, `chroot`, `mknod`). The image it emits
+carries no notion of privilege — Incus runs the resulting container **unprivileged**
+(root inside → a mapped, harmless uid on the host), exactly like everything above. So
+building as root does not change your runtime security posture.
+
+**Image = disposable base; state = a separate volume.** Put the slow, deterministic layer
+(OS, packages, static config) in the image; put persistent data on a **separate Incus
+custom volume**. Then a base-image update is a rootfs swap that leaves your data alone.
+Never bake secrets or per-instance setup into a shared image.
+
+### The `image.sh` helper
+
+`image.sh` (in this folder) wraps the whole lifecycle. `distrobuilder` is not packaged in
+Debian `main`; on the first `build` the script offers to install it (a Go build into
+`/usr/local/bin`) after a prompt. Only the build uses `sudo`; every `incus` call runs as
+your incus-admin user.
+
+```sh
+# create/refresh the image from its definition (alias = the YAML's basename, "example")
+"./image.sh" build "../2 - Containers/example.yaml"
+
+# deploy an instance, with a persistent volume mounted for state
+"./image.sh" deploy example demo --volume default/demo-data:/srv/data
+curl http://<demo NAT IP>              # the baked page; image.sh prints the IP
+
+# ship a new base image to it: rebuild the image, then swap the rootfs
+#   (edit the marker/serial in example.yaml first, then:)
+"./image.sh" build  "../2 - Containers/example.yaml"
+"./image.sh" update example demo       # -> incus rebuild: fresh rootfs, volumes kept
+
+# tear it all down
+"./image.sh" destroy demo --image example --volume default/demo-data
+
+"./image.sh" status                    # images / instances / volumes at a glance
+```
+
+Under the hood these are just:
+
+```sh
+sudo distrobuilder build-incus example.yaml ./out
+incus image import ./out/incus.tar.xz ./out/rootfs.squashfs --alias example
+incus init example demo -p default   # + incus config device add … disk (the volume)
+incus rebuild example demo           # update: rootfs from the new image, config/volumes kept
+```
+
+The `update` step is the point of the split: after it, the instance's
+`/etc/homelab-image-version` marker shows the **new** image while a file written to the
+mounted volume (`/srv/data`) still survives — fresh rootfs, preserved state.
+
+**Reproducibility note.** `apt` still floats within the suite between builds; for a
+build pinned to an exact point in time, point the definition's repositories at
+[`snapshot.debian.org`](https://snapshot.debian.org/). That's optional hardening beyond
+the example.
+
 ## Re-running
 
 The script is safe to re-run. `incus admin init --preseed` is idempotent (it creates

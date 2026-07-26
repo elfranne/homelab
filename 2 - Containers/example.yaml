@@ -1,0 +1,90 @@
+# example.yaml — a distrobuilder definition for the homelab image lifecycle example.
+#
+# This is the "one YAML per image" convention: each image/service gets its own
+# definition in this folder. Build, deploy, update and destroy it with the generic
+# helper in the hypervisor step:
+#
+#   "../1 - Hypervisor Install/image.sh" build   "2 - Containers/example.yaml"
+#   "../1 - Hypervisor Install/image.sh" deploy  example demo --volume default/demo-data:/srv/data
+#   "../1 - Hypervisor Install/image.sh" update  example demo      # after bumping the marker below
+#   "../1 - Hypervisor Install/image.sh" destroy demo --image example --volume default/demo-data
+#
+# It builds a minimal Debian 13 image with nginx, a baked landing page, and a rootfs
+# version marker (/etc/homelab-image-version) so an `update` visibly replaces the rootfs
+# while data on an attached volume survives.
+
+image:
+  distribution: debian
+  release: trixie
+  architecture: amd64
+  description: |-
+    Homelab example ({{ image.distribution }} {{ image.release }})
+  # Bump `serial` AND the marker in the post-packages action below, then rebuild, to
+  # demonstrate an update. Any change to the definition produces a fresh image.
+  serial: "0001"
+  expiry: 30d
+
+source:
+  downloader: debootstrap
+  url: http://deb.debian.org/debian
+  keyring: /usr/share/keyrings/debian-archive-keyring.gpg
+
+# Standard generators so the image gets a proper hostname/hosts at launch.
+files:
+  - path: /etc/hostname
+    generator: hostname
+  - path: /etc/hosts
+    generator: hosts
+  # Bring eth0 up via DHCP on the Incus NAT bridge (systemd-networkd + resolved).
+  - path: /etc/systemd/network/eth0.network
+    generator: dump
+    content: |-
+      [Match]
+      Name=eth0
+
+      [Network]
+      DHCP=yes
+  - path: /etc/resolv.conf
+    generator: remove
+
+packages:
+  manager: apt
+  update: true
+  cleanup: true
+  sets:
+    - action: install
+      packages:
+        - systemd-sysv
+        - systemd-resolved
+        - iproute2
+        - ca-certificates
+        - curl
+        - nginx
+  repositories:
+    - name: sources.list
+      url: |-
+        deb http://deb.debian.org/debian trixie main
+        deb http://deb.debian.org/debian trixie-security main
+        deb http://deb.debian.org/debian trixie-updates main
+
+actions:
+  - trigger: post-packages
+    action: |-
+      #!/bin/sh
+      set -eux
+      # Networking + DNS for a system container on the Incus NAT bridge.
+      systemctl enable systemd-networkd systemd-resolved
+      ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+      # Serve a baked landing page so `deploy` needs no per-service provisioning.
+      systemctl enable nginx
+      cat > /var/www/html/index.html <<'HTML'
+      <!doctype html>
+      <title>homelab example image</title>
+      <h1>It works.</h1>
+      <p>Served by nginx from a distrobuilder-built, unprivileged Incus container.</p>
+      HTML
+      # Rootfs version marker — proves the rootfs was replaced on `update` (bump this).
+      echo "example 0001" > /etc/homelab-image-version
+
+mappings:
+  architecture_map: debian
