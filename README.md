@@ -28,3 +28,4 @@ Built on a [Minisforum N5 Pro](https://www.minisforum.com/products/n5-pro) AI NA
 |---|---|---|---|
 | 0 | [OS Install](<0 - OS Install/INSTALL.md>) | Debian Trixie on an encrypted three-disk raidz1 ZFS root, booted via [ZFSBootMenu](https://zfsbootmenu.org/) with remote SSH unlock (dropbear) for headless reboots. | Done |
 | 1 | [Hypervisor Install](<1 - Hypervisor Install/INSTALL.md>) | Virtualization layer on top of the base OS: [Incus](https://linuxcontainers.org/incus/) (containers + VMs) on a dedicated dataset of the encrypted ZFS pool, with a NAT bridge and a macvlan LAN profile. | Done |
+| 2 | [Containers](<2 - Containers/INSTALL.md>) | Services on Incus: a shared [Caddy](https://caddyserver.com/) reverse-proxy ingress with real Let's Encrypt certificates (Cloudflare DNS-01, no open ports), and [Nextcloud](https://nextcloud.com/) as the first native container (nginx + PHP-FPM + PostgreSQL + Redis) with data on its own encrypted ZFS volume. | Done |
