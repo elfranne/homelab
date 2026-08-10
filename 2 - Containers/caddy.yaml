@@ -1,0 +1,200 @@
+# caddy.yaml — the homelab's single HTTPS ingress, as a distrobuilder image.
+#
+# Builds a Debian Trixie image with Caddy (compiled WITH the Cloudflare DNS module, so it
+# can solve the ACME DNS-01 challenge and never needs an inbound port). Deploy and update
+# it with the generic helper in the hypervisor step:
+#
+#   "../1 - Hypervisor Install/image.sh" build "2 - Containers/caddy.yaml"
+#   ./caddy-provision.sh                      # prompts once: LAN IP, ACME email, CF token
+#   "../1 - Hypervisor Install/image.sh" update caddy caddy   # after bumping serial below
+#
+# WHAT IS IN THE IMAGE vs WHAT IS NOT
+#
+# `incus rebuild` (what `image.sh update` runs) throws the whole root filesystem away. Only
+# instance config keys and attached volumes survive it. So this image contains ONLY the
+# disposable base — Caddy, the systemd unit, the users — and everything that must outlive an
+# update lives on the instance's state volume, mounted at /var/lib/homelab:
+#
+#   /var/lib/homelab/caddy.env   the Cloudflare API token (mode 600, written by provisioning)
+#   /var/lib/homelab/conf.d/     one <host>.caddy per service, added as services are deployed
+#   /var/lib/homelab/caddy/      Caddy's ACME store — certificates and account keys
+#
+# That last one matters: Let's Encrypt allows only 5 certificates per week for the same set
+# of names, so a rebuild that discarded the store would re-issue everything and could lock
+# you out of your own certificates. XDG_DATA_HOME in the unit below is what redirects it.
+#
+# Per-instance CONFIG (as opposed to secrets) is not baked either — it comes from `user.*`
+# keys on the instance, rendered into the rootfs by the Incus templates below every time the
+# container is created or started. That is what makes an update self-healing: the fresh
+# rootfs regenerates its own Caddyfile and its own LAN address with nothing re-running.
+#
+#   user.acme_email   contact address Let's Encrypt uses for expiry notices
+#   user.lan_ip       static LAN address for eth1, CIDR form, e.g. 192.168.1.50/24
+
+image:
+  distribution: debian
+  release: trixie
+  architecture: amd64
+  description: |-
+    Homelab Caddy ingress ({{ image.distribution }} {{ image.release }})
+  # Bump `serial` AND the marker in the post-packages action to ship a new base image.
+  serial: "0001"
+  expiry: 30d
+
+source:
+  downloader: debootstrap
+  url: http://deb.debian.org/debian
+
+files:
+  - path: /etc/hostname
+    generator: hostname
+  - path: /etc/hosts
+    generator: hosts
+
+  # eth0 — the NAT bridge from the step-1 `default` profile. This carries the default route:
+  # outbound to the Cloudflare API for DNS-01, and inbound to the private backend containers.
+  - path: /etc/systemd/network/eth0.network
+    generator: dump
+    content: |-
+      [Match]
+      Name=eth0
+
+      [Network]
+      DHCP=yes
+  - path: /etc/resolv.conf
+    generator: remove
+
+  # eth1 — macvlan on the uplink, the address LAN clients actually connect to. Deliberately
+  # has NO Gateway=: eth0 owns the default route, so there is never any ambiguity about which
+  # interface originates outbound traffic. Rendered from user.lan_ip at create and at every
+  # start, so it survives `incus rebuild`.
+  - generator: template
+    name: eth1-network
+    path: /etc/systemd/network/10-eth1.network
+    template:
+      when:
+        - create
+        - start
+    content: |-
+      [Match]
+      Name=eth1
+
+      [Network]
+      {% if config_get("user.lan_ip", "") %}Address={{ config_get("user.lan_ip", "") }}{% endif %}
+
+  # The base Caddyfile: global options plus the per-service imports. Services are NOT listed
+  # here — each drops its own file into conf.d on the volume, so this file never changes as
+  # the homelab grows, and the import survives a rebuild because the directory does.
+  - generator: template
+    name: caddyfile
+    path: /etc/caddy/Caddyfile
+    template:
+      when:
+        - create
+        - start
+    content: |-
+      {
+      {% if config_get("user.acme_email", "") %}	email {{ config_get("user.acme_email", "") }}{% endif %}
+      }
+
+      # Per-service sites, one file per host, each with its own DNS-01 certificate.
+      # These live on the state volume so they outlive an image update.
+      import /var/lib/homelab/conf.d/*.caddy
+
+  # Everything Caddy needs on the volume, created before the service starts. The placeholder
+  # matters: an `import` glob that matches nothing is a Caddyfile syntax error, so a freshly
+  # deployed proxy with no services yet would otherwise refuse to start.
+  - path: /etc/tmpfiles.d/homelab-caddy.conf
+    generator: dump
+    mode: "0644"
+    content: |-
+      d /var/lib/homelab        0755 root  root  -
+      d /var/lib/homelab/caddy  0700 caddy caddy -
+      d /var/lib/homelab/conf.d 0750 caddy caddy -
+      f /var/lib/homelab/conf.d/00-placeholder.caddy 0640 caddy caddy - # Add services here: one <host>.caddy file per service.
+
+  - path: /etc/systemd/system/caddy.service
+    generator: dump
+    mode: "0644"
+    content: |-
+      [Unit]
+      Description=Caddy reverse proxy (homelab ingress)
+      Documentation=https://caddyserver.com/docs/
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=notify
+      User=caddy
+      Group=caddy
+      # Redirects Caddy's data directory (certificates, ACME account keys) onto the state
+      # volume at /var/lib/homelab/caddy. Without this it would sit in the rootfs and be
+      # destroyed by every `incus rebuild`.
+      Environment=XDG_DATA_HOME=/var/lib/homelab
+      # Leading '-' so a not-yet-provisioned container still starts instead of failing.
+      EnvironmentFile=-/var/lib/homelab/caddy.env
+      ExecStart=/usr/bin/caddy run --config /etc/caddy/Caddyfile
+      ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile --force
+      # Before provisioning there is no token and no site file; retry rather than give up.
+      Restart=on-failure
+      RestartSec=5s
+      TimeoutStopSec=5s
+      LimitNOFILE=1048576
+      AmbientCapabilities=CAP_NET_BIND_SERVICE
+      PrivateTmp=true
+      ProtectSystem=full
+
+      [Install]
+      WantedBy=multi-user.target
+
+packages:
+  manager: apt
+  update: true
+  cleanup: true
+  sets:
+    - action: install
+      packages:
+        - systemd-sysv
+        - systemd-resolved
+        - iproute2
+        - ca-certificates
+        - curl
+  repositories:
+    - name: sources.list
+      url: |-
+        deb http://deb.debian.org/debian trixie main
+        deb http://deb.debian.org/debian trixie-security main
+        deb http://deb.debian.org/debian trixie-updates main
+
+actions:
+  - trigger: post-packages
+    action: |-
+      #!/bin/sh
+      set -eux
+      # Networking + DNS for a system container on the Incus NAT bridge.
+      systemctl enable systemd-networkd systemd-resolved
+      ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+
+      # The caddy user gets a FIXED uid/gid on purpose. Files on the state volume outlive the
+      # rootfs, so if a later rebuild happened to allocate a different uid, Caddy would no
+      # longer own its own certificates.
+      groupadd --system --gid 900 caddy
+      useradd --system --uid 900 --gid 900 --home /var/lib/caddy --create-home \
+              --shell /usr/sbin/nologin caddy
+      install -d -o caddy -g caddy -m 0750 /etc/caddy
+
+      # Stock Caddy ships without any DNS provider. Fetch the official build that bundles the
+      # Cloudflare module, then assert it is really in there — a silently plain binary would
+      # only fail later, at certificate-issuance time.
+      curl -fsSL -o /usr/bin/caddy \
+        "https://caddyserver.com/api/download?os=linux&arch=amd64&p=github.com/caddy-dns/cloudflare"
+      chmod 0755 /usr/bin/caddy
+      caddy list-modules | grep -q dns.providers.cloudflare
+
+      systemctl enable caddy
+
+      # Rootfs version marker — proves the rootfs was replaced on `update` (bump this).
+      echo "caddy 0001" > /etc/homelab-image-version
+
+mappings:
+  architecture_map: debian

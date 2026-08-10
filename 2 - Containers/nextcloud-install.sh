@@ -1,24 +1,39 @@
 #!/usr/bin/env bash
 #
 # nextcloud-install.sh — Nextcloud as a native Incus system container, behind the
-# step-2 Caddy reverse proxy.
+# step-2 Caddy ingress.
 #
 # Creates ONE private container on the NAT bridge (never on the LAN) running the plain
 # Debian stack — nginx + PHP-FPM + PostgreSQL + Redis + the Nextcloud PHP app — with the
 # user data on its OWN Incus custom ZFS volume (independent snapshots; inherits the
-# pool's encryption). It then registers the site with the Caddy proxy created by
-# reverse-proxy-install.sh, which terminates TLS with a real Let's Encrypt certificate
+# pool's encryption). It then registers the site with the Caddy container created by
+# caddy-provision.sh, which terminates TLS with a real Let's Encrypt certificate
 # (DNS-01 via Cloudflare) — so nothing here opens an inbound port.
 #
 # Layout:
-#     LAN client ─▶ cloud.<domain> (DNS ─▶ proxy LAN IP) ─▶ Caddy (TLS)
+#     LAN client ─▶ cloud.<domain> (DNS ─▶ caddy LAN IP) ─▶ Caddy (TLS)
 #                     ─▶ http://<this container, NAT>:80  ─▶ nginx ─▶ PHP-FPM ─▶ Nextcloud
 #
-# Interactive, fail-fast, idempotent. Run it AFTER reverse-proxy-install.sh, from the
-# box (or anywhere `incus` reaches this server) as a user in the incus-admin group (or
-# root). It only talks to Incus and the containers — it changes nothing on the host.
+# WHY THIS IS NOT A DISTROBUILDER IMAGE
 #
-#   Usage:   ./nextcloud-install.sh
+# The Caddy ingress is built from caddy.yaml and updated by swapping its rootfs
+# (`image.sh update`). Nextcloud deliberately is NOT: it is a stateful application, and the
+# image model only pays off for services that carry little or no state. Baking it into an
+# image means every rebuild has to work around the PostgreSQL cluster, config.php (which
+# holds the database password) and web-installed apps all living in the rootfs — and it
+# makes you, not Debian, responsible for tracking Nextcloud releases, PHP compatibility and
+# PostgreSQL major upgrades. So this container is provisioned imperatively and upgraded IN
+# PLACE, which is also how the wider Nextcloud-on-Incus world does it.
+#
+# Consequence: the rootfs is never replaced, so `incus snapshot nextcloud` is a perfectly
+# good rollback here (unlike the image-backed containers, where snapshots block a rebuild).
+#
+# Interactive, fail-fast, idempotent. Run it AFTER caddy-provision.sh, from the box (or
+# anywhere `incus` reaches this server) as a user in the incus-admin group (or root). It
+# only talks to Incus and the containers — it changes nothing on the host.
+#
+#   Usage:   ./nextcloud-install.sh            # install, or re-apply config if installed
+#            ./nextcloud-install.sh upgrade    # apt + new Nextcloud release, in place
 #            ./nextcloud-install.sh --help
 #
 #   All settings are prompted at the start; the CONFIG values below are only the defaults
@@ -36,8 +51,11 @@ NC_DATA_VOLUME="nextcloud-data" # Incus custom volume (on the 'default' pool) fo
 NC_PHONE_REGION="DK"           # default_phone_region (ISO 3166-1 alpha-2)
 
 STORAGE_POOL="default"         # Incus storage pool created in step 1
-PROXY_NAME="proxy"             # the reverse-proxy container from reverse-proxy-install.sh
-PROXY_CONF_DIR="/etc/caddy/conf.d"  # where the proxy imports per-service site files
+CADDY_NAME="caddy"             # the ingress container from caddy-provision.sh
+# Per-service site files live on the CADDY CONTAINER'S STATE VOLUME, not in its rootfs —
+# the caddy image imports from here, so a file written to /etc/caddy/conf.d instead would
+# be thrown away by the next `image.sh update caddy caddy`.
+CADDY_CONF_DIR="/var/lib/homelab/conf.d"
 
 DB_NAME="nextcloud"
 DB_USER="nextcloud"
@@ -114,6 +132,20 @@ wait_for_net() {
 }
 gen_secret() { openssl rand -hex 24 2>/dev/null || tr -dc 'a-f0-9' </dev/urandom | head -c48; }
 
+nc_installed() { # 0 if Nextcloud reports itself installed
+  cexec test -f /var/www/nextcloud/occ 2>/dev/null || return 1
+  occ status 2>/dev/null | grep -q 'installed: true'
+}
+
+db_maintenance() {
+  # Nextcloud does NOT apply these during an upgrade — on a large instance they can take a
+  # while — so it just warns in Admin -> Overview until you run them by hand. Cheap and a
+  # no-op on a fresh install, so it runs unconditionally.
+  occ db:add-missing-indices
+  occ db:add-missing-columns
+  occ db:add-missing-primary-keys
+}
+
 # =====================================================================================
 run() {
   echo "${BLD}Nextcloud installer — native Incus container behind the Caddy proxy${RST}"
@@ -124,17 +156,17 @@ run() {
   incus info >/dev/null 2>&1 || die "'incus info' failed — Incus (step 1) not reachable, or you're not in incus-admin/root."
   incus storage list -f csv 2>/dev/null | grep -q "^${STORAGE_POOL}," \
     || die "Incus storage pool '$STORAGE_POOL' missing — run step 1 (incus-install.sh) first."
-  ct_exists "$PROXY_NAME" \
-    || die "Proxy container '$PROXY_NAME' not found — run reverse-proxy-install.sh first."
-  incus exec "$PROXY_NAME" -- systemctl is-active --quiet caddy \
-    || die "Caddy is not running in '$PROXY_NAME' — fix reverse-proxy-install.sh before adding a service."
-  local PROXY_NAT_IP; PROXY_NAT_IP="$(ct_ip "$PROXY_NAME" eth0)"
-  [[ -n "$PROXY_NAT_IP" ]] || die "Could not read the proxy's NAT (eth0) IP — is '$PROXY_NAME' running?"
-  ok "Incus reachable; proxy '$PROXY_NAME' up (NAT IP $PROXY_NAT_IP), Caddy active."
+  ct_exists "$CADDY_NAME" \
+    || die "Caddy container '$CADDY_NAME' not found — run caddy-provision.sh first."
+  incus exec "$CADDY_NAME" -- systemctl is-active --quiet caddy \
+    || die "Caddy is not running in '$CADDY_NAME' — fix the ingress before adding a service."
+  local CADDY_NAT_IP; CADDY_NAT_IP="$(ct_ip "$CADDY_NAME" eth0)"
+  [[ -n "$CADDY_NAT_IP" ]] || die "Could not read the ingress NAT (eth0) IP — is '$CADDY_NAME' running?"
+  ok "Incus reachable; ingress '$CADDY_NAME' up (NAT IP $CADDY_NAT_IP), Caddy active."
 
-  if ct_exists "$NC_NAME" && incus exec "$NC_NAME" -- test -f /var/www/nextcloud/occ 2>/dev/null \
-     && occ status 2>/dev/null | grep -q 'installed: true'; then
-    warn "Nextcloud already installed in '$NC_NAME' — re-applying config + proxy registration only (idempotent)."
+  if ct_exists "$NC_NAME" && ct_running "$NC_NAME" && nc_installed; then
+    warn "Nextcloud already installed in '$NC_NAME' — re-applying config + ingress registration only (idempotent)."
+    warn "To move Nextcloud itself forward, use: ./nextcloud-install.sh upgrade"
   fi
 
   # ---- Phase 1: settings ----
@@ -157,8 +189,7 @@ run() {
   # Admin password (hidden, confirmed) — only needed for a fresh install.
   local NC_ADMIN_PASS=""
   local fresh_install=1
-  if ct_exists "$NC_NAME" && incus exec "$NC_NAME" -- test -f /var/www/nextcloud/occ 2>/dev/null \
-     && occ status 2>/dev/null | grep -q 'installed: true'; then
+  if ct_exists "$NC_NAME" && ct_running "$NC_NAME" && nc_installed; then
     fresh_install=0
   fi
   if (( fresh_install )); then
@@ -177,7 +208,7 @@ run() {
   printf '  %-16s %s\n' "Admin user:"   "$NC_ADMIN_USER"
   printf '  %-16s %s\n' "Data volume:"  "$STORAGE_POOL/$NC_DATA_VOLUME (Incus custom ZFS volume)"
   printf '  %-16s %s\n' "Database:"     "PostgreSQL ($DB_NAME / $DB_USER)"
-  printf '  %-16s %s\n' "Proxy:"        "$NC_NAME → Caddy '$PROXY_NAME' ($PROXY_CONF_DIR/${NC_DOMAIN}.caddy)"
+  printf '  %-16s %s\n' "Proxy:"        "$NC_NAME → Caddy '$CADDY_NAME' ($CADDY_CONF_DIR/${NC_DOMAIN}.caddy)"
   printf '  %-16s %s\n' "Phone region:" "$NC_PHONE_REGION"
   require_yes "Proceed with these settings?"
 
@@ -299,7 +330,7 @@ SQL
   occ config:system:set overwrite.cli.url --value="https://${NC_DOMAIN}"
   occ config:system:set overwriteprotocol --value=https
   occ config:system:set overwritehost --value="$NC_DOMAIN"
-  occ config:system:set trusted_proxies 0 --value="$PROXY_NAT_IP"
+  occ config:system:set trusted_proxies 0 --value="$CADDY_NAT_IP"
   # Redis (locking + distributed) + APCu (local) caching.
   occ config:system:set memcache.local --value='\OC\Memcache\APCu'
   occ config:system:set memcache.locking --value='\OC\Memcache\Redis'
@@ -310,6 +341,9 @@ SQL
   occ config:system:set maintenance_window_start --type=integer --value=1
   occ config:system:set default_phone_region --value="$NC_PHONE_REGION"
   ok "Reverse-proxy + caching + regional config applied."
+
+  db_maintenance
+  ok "Database indices/columns/primary keys checked."
 
   # Background jobs via a systemd timer running cron.php every 5 minutes.
   cexec sh -c 'cat > /etc/systemd/system/nextcloudcron.service' <<'UNIT'
@@ -338,11 +372,11 @@ UNIT
   # ---- Phase 6: register with the Caddy proxy ----
   phase 6 "Register the site with the Caddy proxy"
   render_caddy_site | sed -e "s|__DOMAIN__|${NC_DOMAIN}|g" -e "s|__TARGET__|${NC_NAT_IP}:80|g" \
-    | incus exec "$PROXY_NAME" -- sh -c "umask 022; cat > '${PROXY_CONF_DIR}/${NC_DOMAIN}.caddy' && chown caddy:caddy '${PROXY_CONF_DIR}/${NC_DOMAIN}.caddy'"
-  incus exec "$PROXY_NAME" -- rm -f "${PROXY_CONF_DIR}/00-placeholder.caddy"
-  incus exec "$PROXY_NAME" -- caddy validate --config /etc/caddy/Caddyfile >/dev/null \
-    || die "Caddy config invalid after adding ${NC_DOMAIN}.caddy — check the site file in '$PROXY_NAME'."
-  incus exec "$PROXY_NAME" -- systemctl reload caddy
+    | incus exec "$CADDY_NAME" -- sh -c "umask 022; cat > '${CADDY_CONF_DIR}/${NC_DOMAIN}.caddy' && chown caddy:caddy '${CADDY_CONF_DIR}/${NC_DOMAIN}.caddy'"
+  incus exec "$CADDY_NAME" -- rm -f "${CADDY_CONF_DIR}/00-placeholder.caddy"
+  incus exec "$CADDY_NAME" -- caddy validate --config /etc/caddy/Caddyfile >/dev/null \
+    || die "Caddy config invalid after adding ${NC_DOMAIN}.caddy — check the site file in '$CADDY_NAME'."
+  incus exec "$CADDY_NAME" -- systemctl reload caddy
   ok "Proxy now serves https://${NC_DOMAIN} → ${NC_NAT_IP}:80 (its own DNS-01 certificate)."
 
   # ---- finish ----
@@ -352,15 +386,17 @@ UNIT
   ok "Nextcloud installed."
   echo
   echo "${BLD}Next:${RST}"
-  local PROXY_LAN_IP; PROXY_LAN_IP="$(ct_ip "$PROXY_NAME" eth1)"
-  echo "  1. Create the DNS record:  ${BLD}${NC_DOMAIN}  A  ${PROXY_LAN_IP:-<proxy LAN IP>}${RST}  (DNS-only / grey-cloud)."
+  local CADDY_LAN_IP; CADDY_LAN_IP="$(ct_ip "$CADDY_NAME" eth1)"
+  echo "  1. Create the DNS record:  ${BLD}${NC_DOMAIN}  A  ${CADDY_LAN_IP:-<caddy LAN IP>}${RST}  (DNS-only / grey-cloud)."
   echo "  2. Browse to  ${BLD}https://${NC_DOMAIN}${RST}  and log in as '${NC_ADMIN_USER}'."
   echo "  3. First hit may take a few seconds while Caddy fetches the certificate (DNS-01)."
   echo "  4. Check Settings → Administration → Overview for a clean bill of health."
   echo "  -  Data lives on the Incus volume ${STORAGE_POOL}/${NC_DATA_VOLUME}; snapshot it with:"
   echo "       incus storage volume snapshot ${STORAGE_POOL} ${NC_DATA_VOLUME}"
-  echo "  -  Note: the proxy target is pinned to ${NC_NAT_IP}. If you ever rebuild '$NC_NAME'"
-  echo "     and its NAT IP changes, re-run this script to refresh the proxy site file."
+  echo "  -  Upgrade Nextcloud in place with:  ${BLD}./nextcloud-install.sh upgrade${RST}"
+  echo "     (this container is never rebuilt, so 'incus snapshot $NC_NAME' is a valid rollback)."
+  echo "  -  Note: the ingress target is pinned to ${NC_NAT_IP}. If you ever delete and recreate"
+  echo "     '$NC_NAME' and its NAT IP changes, re-run this script to refresh the site file."
 }
 
 # The official Nextcloud nginx configuration (plain HTTP :80). Placeholders __DOMAIN__
@@ -463,6 +499,72 @@ __DOMAIN__ {
 CADDY
 }
 
+# =====================================================================================
+# In-place upgrade. This is the counterpart to `image.sh update` for the image-backed
+# containers: because this container's rootfs is never replaced, upgrading means moving the
+# packages and the application forward where they stand.
+#
+# The Nextcloud code swap goes through the OFFICIAL updater rather than being hand-rolled:
+# the data volume is mounted *inside* /var/www/nextcloud, so the documented "move the old
+# directory aside and unpack the new one" procedure cannot work here — you cannot move a
+# directory with a mount point in it. updater.phar handles the swap in place, takes its own
+# backup, and with --no-interaction runs `occ upgrade` itself.
+upgrade() {
+  echo "${BLD}Nextcloud in-place upgrade${RST}"
+
+  phase 0 "Preflight checks"
+  need_cmd incus
+  incus info >/dev/null 2>&1 || die "'incus info' failed — Incus (step 1) not reachable, or you're not in incus-admin/root."
+  ct_exists "$NC_NAME" || die "Container '$NC_NAME' not found — run './nextcloud-install.sh' first."
+  ct_running "$NC_NAME" || incus start "$NC_NAME"
+  nc_installed || die "Nextcloud is not installed in '$NC_NAME' — run './nextcloud-install.sh' first."
+  local before; before="$(occ status 2>/dev/null | awk '/versionstring/ {print $3}')"
+  ok "Nextcloud $before is installed and reachable."
+
+  # The rootfs is disposable for image-backed containers but NOT for this one, so a plain
+  # instance snapshot is the right rollback here — and it costs nothing on ZFS.
+  echo
+  echo "A snapshot is the one-command way back if this upgrade goes wrong."
+  if confirm "Take an Incus snapshot of '$NC_NAME' before upgrading?"; then
+    local snap; snap="preupgrade-$(date +%Y%m%d-%H%M%S)"
+    incus snapshot create "$NC_NAME" "$snap"
+    ok "Snapshot '$snap' created (restore with: incus snapshot restore $NC_NAME $snap)."
+  else
+    warn "Continuing without a snapshot."
+  fi
+
+  phase 1 "Operating-system packages"
+  pause
+  cexec sh -c 'export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get -y -qq upgrade'
+  ok "Debian packages upgraded."
+
+  phase 2 "Nextcloud release (official updater)"
+  pause
+  # --no-interaction also makes the updater run `occ upgrade` and drop maintenance mode
+  # afterwards, unless something failed — in which case it deliberately stays on.
+  cexec runuser -u www-data -- php /var/www/nextcloud/updater/updater.phar --no-interaction \
+    || die "updater.phar failed. The instance is likely still in maintenance mode — inspect with
+  incus exec $NC_NAME -- runuser -u www-data -- php /var/www/nextcloud/occ status
+  and roll back with 'incus snapshot restore $NC_NAME <snapshot>' if needed."
+  # Harmless if the updater already ran it; required if only apt moved PHP forward.
+  occ upgrade || log "No Nextcloud database upgrade was pending."
+
+  phase 3 "Post-upgrade database maintenance"
+  db_maintenance
+  occ maintenance:mode --off || true
+  local PHPV; PHPV="$(cexec sh -c 'ls -1 /etc/php 2>/dev/null | sort -V | tail -1')"
+  [[ -n "$PHPV" ]] && cexec systemctl restart "php${PHPV}-fpm" nginx
+  ok "Database maintenance done; PHP-FPM and nginx restarted."
+
+  echo
+  occ status || true
+  echo
+  local after; after="$(occ status 2>/dev/null | awk '/versionstring/ {print $3}')"
+  ok "Upgraded: ${before:-?} -> ${after:-?}"
+  echo "  - Check Settings → Administration → Overview for a clean bill of health."
+  echo "  - If anything is wrong: incus snapshot restore $NC_NAME <snapshot>"
+}
+
 usage() {
   sed -n '2,/^set -Eeuo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
   exit 0
@@ -471,6 +573,7 @@ usage() {
 main() {
   case "${1:-}" in
     --help|-h) usage ;;
+    upgrade)   upgrade ;;
     "")        run ;;
     *)         die "Unknown argument: $1 (use --help)";;
   esac

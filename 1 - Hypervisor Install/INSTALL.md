@@ -370,6 +370,31 @@ building as root does not change your runtime security posture.
 custom volume**. Then a base-image update is a rootfs swap that leaves your data alone.
 Never bake secrets or per-instance setup into a shared image.
 
+**Per-instance settings go in `user.*` keys, not in the image.** `incus rebuild` keeps an
+instance's config and devices while replacing its rootfs, so a `user.*` key survives an
+update — and an image can read one back at runtime through an **Incus template**, baked in
+with distrobuilder's `template` generator:
+
+```yaml
+files:
+  - generator: template
+    name: caddyfile
+    path: /etc/caddy/Caddyfile          # rendered inside the container…
+    template:
+      when: [create, start]             # …at create, and at every start
+    content: |-
+      { email {{ config_get("user.acme_email", "") }} }
+```
+
+Pass the values at deploy time with `--config user.acme_email=…`, and the container
+regenerates its own configuration after every update with nothing re-running. Step 2 uses
+exactly this for the proxy's Caddyfile and LAN address, and for Nextcloud's nginx vhost.
+
+Between the two mechanisms, a rule of thumb: **settings** (a hostname, an address, an email)
+are `user.*` keys; **secrets** (an API token, a database password) belong on the volume at
+mode `600`, because `user.*` keys are visible in `incus config show` and travel inside
+`incus export` tarballs and instance copies.
+
 ### The `image.sh` helper
 
 `image.sh` (in this folder) wraps the whole lifecycle. `distrobuilder` is not packaged in
@@ -384,6 +409,10 @@ your incus-admin user.
 # deploy an instance, with a persistent volume mounted for state
 "./image.sh" deploy example demo --volume default/demo-data:/srv/data
 curl http://<demo NAT IP>              # the baked page; image.sh prints the IP
+
+# …and, for an image with templates, the per-instance settings they read back
+"./image.sh" deploy caddy caddy --volume default/caddy-state:/var/lib/homelab \
+    --config user.acme_email=me@example.com --config user.lan_ip=192.168.1.50/24
 
 # ship a new base image to it: rebuild the image, then swap the rootfs
 #   (edit the marker/serial in example.yaml first, then:)
@@ -409,10 +438,29 @@ The `update` step is the point of the split: after it, the instance's
 `/etc/homelab-image-version` marker shows the **new** image while a file written to the
 mounted volume (`/srv/data`) still survives — fresh rootfs, preserved state.
 
+**`update` refuses on an instance with snapshots.** `incus rebuild` does not run when the
+instance has any, so a snapshot taken "just in case" before an upgrade is precisely what
+blocks the upgrade. `image.sh update` checks first and tells you, rather than failing
+obscurely. Snapshot the **state volume** instead — the rootfs is disposable by design:
+
+```sh
+incus storage volume snapshot default demo-data
+```
+
 **Reproducibility note.** `apt` still floats within the suite between builds; for a
 build pinned to an exact point in time, point the definition's repositories at
-[`snapshot.debian.org`](https://snapshot.debian.org/). That's optional hardening beyond
-the example.
+[`snapshot.debian.org`](https://snapshot.debian.org/). Pin anything you fetch by hand in a
+`post-packages` action too — a URL like `latest.tar.gz` would make the image a moving
+target, which defeats the point of building one. That's optional hardening beyond the
+example.
+
+**Not every service should be an image.** This machinery suits services that carry little
+or no state, where replacing the rootfs really is just an update. A stateful service — one
+with a database, generated config holding secrets, or plugins installed at runtime — is
+usually better as a plain container upgraded in place, because making a rootfs swap safe
+means redirecting every one of those onto a volume first. Step 2 has one of each and
+explains the choice: see
+[Two deployment models](<../2 - Containers/INSTALL.md#two-deployment-models-and-how-to-choose>).
 
 ## Re-running
 
