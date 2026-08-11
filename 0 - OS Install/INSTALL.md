@@ -38,10 +38,13 @@ Push with scp from your workstation:
    sudo apt update && sudo apt install -y openssh-server
    ip -4 addr show                              # note the live session's IP
    ```
+
 2. On your **workstation**, run this command. Log in as the live user `user`, with password `live`:
+
    ```sh
    scp zbm-install.sh ~/.ssh/id_ed25519.pub user@<live-ip>:~/
    ```
+
 3. Go back to the target. Connect with `ssh user@<live-ip>`, or continue on the console. The files
    are now in `/home/user/`. Run the installer from there, with `sudo ./zbm-install.sh`.
 
@@ -62,7 +65,7 @@ Push with scp from your workstation:
    default, or type a replacement. If you edit the block, you only change these pre-filled defaults.
 
    | Variable | Meaning | Default |
-   |---|---|---|
+   | --- | --- | --- |
    | `TIMEZONE` | System timezone | `Etc/UTC` |
    | `KEYMAP` | Console keymap for the installed OS's TTY. The installer writes it to both `/etc/vconsole.conf` and `/etc/default/keyboard`, and also bakes it into the ZFSBootMenu image, so the passphrase prompt matches your physical keyboard. This value must be a vconsole keymap name, checked at runtime against `localectl list-keymaps`. Examples: `us`, `dk`, `de`, `uk`. For most layouts, this value equals the X11 layout code. | `dk` |
    | `POOL_NAME` | ZFS pool name | `zroot` |
@@ -153,7 +156,7 @@ You do not run this stage yourself. Stage 1 calls `zbm-install.sh --stage2` insi
 you. Before this call, the script reads back the disk list, hostname, admin username, network
 config, and tunable settings that Stage 1 recorded earlier.
 
-8. **Phase 8.** The script sets the hostname and the `/etc/hosts` file. It writes the apt sources:
+1. **Phase 8.** The script sets the hostname and the `/etc/hosts` file. It writes the apt sources:
    main, security, and updates. It sets the locale, the timezone, and the console keymap (`KEYMAP`),
    writing this keymap to both `/etc/vconsole.conf` and `/etc/default/keyboard`. It installs
    `openssh-server` and `sudo`.
@@ -166,7 +169,7 @@ config, and tunable settings that Stage 1 recorded earlier.
    Then the script creates the admin user, and prompts you to **set a password** for both the admin
    user and `root`. If you type the password wrong, the script asks again. It does not stop the
    install.
-9. **Phase 9.** The script installs the Linux kernel and ZFS through DKMS. It checks that the ZFS
+2. **Phase 9.** The script installs the Linux kernel and ZFS through DKMS. It checks that the ZFS
    kernel module built for the installed kernel. If you set an ARC cap, the script applies it. The
    script enables the ZFS services, mounts the EFI partition, rebuilds the initramfs, and checks that
    the encryption key transferred correctly.
@@ -175,7 +178,7 @@ config, and tunable settings that Stage 1 recorded earlier.
    entry. It snapshots the booted root before every `apt` operation, then prunes old snapshots so
    only the newest 20 `apt_` snapshots remain. With this hook, you can undo a package upgrade with
    one reboot, into a ZBM boot environment.
-10. **Phase 10.** The script builds ZFSBootMenu from source, pinned to `ZBM_VERSION`. It bakes in the
+3. **Phase 10.** The script builds ZFSBootMenu from source, pinned to `ZBM_VERSION`. It bakes in the
     `dracut-crypt-ssh` module, pinned to `CRYPT_SSH_COMMIT`, and dracut's `i18n` module, for
     `KEYMAP`. It generates dedicated dropbear host keys, and installs your authorized key. It writes
     the ZBM config, with the static IP configuration from Stage 1 and `rd.vconsole.keymap` baked
@@ -187,7 +190,7 @@ config, and tunable settings that Stage 1 recorded earlier.
     The script keeps a `VMLINUZ-BACKUP.EFI` copy, and registers both a primary and a backup EFI boot
     entry on every disk. It also installs a kernel postinst hook. This hook rotates the backup and
     rebuilds ZBM on every kernel update.
-11. **Phase 11.** The script snapshots the freshly installed root, as `@base_install`, and clones it
+4. **Phase 11.** The script snapshots the freshly installed root, as `@base_install`, and clones it
     into a `_rescue` boot environment. If the main system ever breaks, you can select this boot
     environment from the ZBM menu.
 
@@ -202,11 +205,14 @@ Remove the USB stick. Then reboot the machine. At boot:
    (`KEYMAP`) matters. If your passphrase has punctuation or symbols, check that they type correctly
    on the physical keyboard. You cannot change the keymap interactively at this prompt.
 2. To unlock the box remotely instead, connect to dropbear by SSH while ZBM is waiting:
+
    ```sh
    ssh -p <DROPBEAR_PORT> root@<nas-ip>
    ```
+
    Then run `zfsbootmenu`. This command can also start automatically. Enter the passphrase there.
 3. After the OS boots, connect normally, on port 22:
+
    ```sh
    ssh <admin_user>@<nas-ip>
    ```

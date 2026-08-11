@@ -24,7 +24,7 @@ This repository builds these two services in different ways, on purpose. This di
 the most important idea on this page.
 
 | | **Image model** (Caddy) | **In-place model** (Nextcloud) |
-|---|---|---|
+| --- | --- | --- |
 | Defined by | `caddy.yaml`, a distrobuilder image definition | `nextcloud-install.sh`, run against a stock image |
 | Deployed by | `image.sh build`, then `caddy-provision.sh` | `nextcloud-install.sh` |
 | Updated by | `image.sh update caddy caddy`: this **replaces** the root file system | `./nextcloud-install.sh upgrade`: `apt`, and the official Nextcloud updater |
@@ -72,7 +72,7 @@ database, write a script.
 
 ## Topology
 
-```
+```none
    LAN clients ─▶ cloud.<domain>  (DNS-only A record ─▶ caddy LAN IP)
                         │
    ┌──────────── caddy container ─────────────┐
@@ -105,7 +105,7 @@ question about which interface starts outbound traffic. Outbound traffic always 
 three things survive a rebuild, and `caddy.yaml` is built around them:
 
 | Survives a rebuild | Used for |
-|---|---|
+| --- | --- |
 | Instance `user.*` config keys | per-instance **settings** (LAN IP, ACME email) |
 | Attached **custom volumes** | **secrets** and all mutable state |
 | Instance **devices** | the state volume itself, and the macvlan `eth1` |
@@ -113,7 +113,7 @@ three things survive a rebuild, and `caddy.yaml` is built around them:
 Everything stateful lives on the `caddy-state` volume, mounted at **`/var/lib/homelab`**:
 
 | Path | Contents |
-|---|---|
+| --- | --- |
 | `caddy.env` | the Cloudflare token, mode `600` |
 | `conf.d/*.caddy` | one file per service. `nextcloud-install.sh` registers here |
 | `caddy/` | the **ACME store**: certificates and account keys |
@@ -122,7 +122,7 @@ Settings are `user.*` keys, and the image carries **Incus templates** that re-re
 matching file at every container start:
 
 | Key | Renders |
-|---|---|
+| --- | --- |
 | `user.acme_email` | the global email in `/etc/caddy/Caddyfile` |
 | `user.lan_ip` | `Address=` in `/etc/systemd/network/10-eth1.network` |
 
@@ -188,7 +188,7 @@ It prompts for the static LAN IP, a Let's Encrypt contact email, and the Cloudfl
 then:
 
 | Phase | What happens |
-|---|---|
+| --- | --- |
 | 0 | Preflight check: `incus` is reachable, the `default` and `lan` profiles and the `caddy` image exist. The script reads the macvlan parent network card from the `lan` profile. On a repeat run, the script pre-fills the prompts from the instance's existing `user.*` keys. |
 | 1 | Prompts for the LAN IP, the ACME email, and the Cloudflare token. |
 | 2 | Runs `incus init` from the image, with `user.lan_ip` and `user.acme_email` set before the first start. Creates and attaches the `caddy-state` volume at `/var/lib/homelab`. Adds the macvlan `eth1`. Starts, or restarts, the container. |
@@ -197,7 +197,7 @@ then:
 Config knobs (all prompted for). Editing the CONFIG block is optional:
 
 | Variable | Meaning | Default |
-|---|---|---|
+| --- | --- | --- |
 | `CADDY_NAME` | Incus instance name | `caddy` |
 | `CADDY_IMAGE` | Image alias: the basename of `caddy.yaml` | `caddy` |
 | `CADDY_LAN_IP` | Static LAN IP for `eth1`, CIDR (your DNS target) | (prompted) |
@@ -223,7 +223,7 @@ It prompts for the hostname, for example `cloud.example.com`, the admin username
 and the phone region. Then:
 
 | Phase | What happens |
-|---|---|
+| --- | --- |
 | 0 | Preflight check: `incus` is reachable, the `default` storage pool exists, and the `caddy` container is up with Caddy active. The script reads the ingress's NAT IP address. |
 | 1 | Prompts for the hostname, the admin username and password, and the phone region. The script skips the password prompt when Nextcloud is already installed. |
 | 2 | Launches the `nextcloud` container (NAT only), creates the **`nextcloud-data` volume**, and attaches it at `/var/www/nextcloud/data`. |
@@ -235,7 +235,7 @@ and the phone region. Then:
 Config knobs, prompted where relevant:
 
 | Variable | Meaning | Default |
-|---|---|---|
+| --- | --- | --- |
 | `NC_NAME` | Incus container name | `nextcloud` |
 | `NC_IMAGE` | Base image launched | `images:debian/13` |
 | `NC_DOMAIN` | Public hostname | (prompted) |
@@ -348,7 +348,7 @@ volume. Give the script an `upgrade` subcommand.
 Either way, register the service with the ingress. Add one site file into the Caddy container,
 at `/var/lib/homelab/conf.d/<host>.caddy`:
 
-```
+```cfg
 app.<domain> {
     tls { dns cloudflare {env.CF_API_TOKEN} }
     reverse_proxy <container NAT IP>:<port>

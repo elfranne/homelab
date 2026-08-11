@@ -27,7 +27,7 @@ Built on a [Minisforum N5 Pro](https://www.minisforum.com/products/n5-pro) AI NA
 ## Steps
 
 | # | Step | Description | Status |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 0 | [OS Install](<0 - OS Install/INSTALL.md>) | This step installs Debian Trixie on an encrypted, three-disk raidz1 ZFS root. It boots through [ZFSBootMenu](https://zfsbootmenu.org/), with remote SSH unlock (dropbear) for headless reboots. | Done |
 | 1 | [Hypervisor Install](<1 - Hypervisor Install/INSTALL.md>) | This step adds a virtualization layer on the base OS. It installs [Incus](https://linuxcontainers.org/incus/) (containers and VMs) on a dedicated dataset of the encrypted ZFS pool. Incus gets a NAT bridge and a macvlan LAN profile. | Done |
 | 2 | [Containers](<2 - Containers/INSTALL.md>) | This step adds two services on Incus. [Caddy](https://caddyserver.com/) is a shared reverse-proxy ingress with real Let's Encrypt certificates, through Cloudflare DNS-01 with no open ports. Caddy is a reproducible [distrobuilder](https://github.com/lxc/distrobuilder) image, and an update swaps its rootfs. [Nextcloud](https://nextcloud.com/) is the first service, with nginx, PHP-FPM, PostgreSQL, and Redis. Nextcloud is a stateful container, upgraded in place, with data on its own encrypted ZFS volume. | Done |
@@ -44,7 +44,7 @@ release that the NAS runs. As a result, `incus-client` and the linters come from
 repository, not from a backport.
 
 | Tool | Source | Used for |
-|---|---|---|
+| --- | --- | --- |
 | `shellcheck`, `shfmt` | apt | linting and formatting the installers |
 | `yamllint`, `python3-yaml` | apt | checking the distrobuilder definitions in `2 - Containers/` |
 | `incus-client` | apt | driving the box from your desk, once you configure a remote |

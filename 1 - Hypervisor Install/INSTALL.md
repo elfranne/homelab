@@ -88,7 +88,7 @@ script prompts for every value at the start of the run, with the CONFIG value al
 the default. Press Enter to accept the default, or type a replacement.
 
 | Variable | Meaning | Default |
-|---|---|---|
+| --- | --- | --- |
 | `INCUS_DATASET` | Dataset created under the detected pool (`<pool>/<this>`) | `incus` |
 | `STORAGE_POOL` | Incus storage-pool name | `default` |
 | `BRIDGE_NAME` | Managed NAT bridge for the `default` profile | `incusbr0` |
@@ -139,6 +139,7 @@ that owns the default route. The script prompts you only if it cannot determine 
 1. Log the admin user out and back in, or run `newgrp incus-admin`. This makes the new group
    membership take effect. **If you skip this step, `incus` commands report a permission error.**
 2. Launch things:
+
    ```sh
    incus launch images:debian/13 c1                    # container, NAT (default profile)
    incus launch images:debian/13 c2 -p lan             # container, real LAN IP (macvlan)
@@ -147,6 +148,7 @@ that owns the default route. The script prompts you only if it cannot determine 
    incus launch images:debian/13 v1 --vm               # virtual machine
    incus list                                          # see instances and their IPs
    ```
+
 3. Incus data lives on ZFS, under `<pool>/incus`. The pool's encryption covers this data. Your
    normal ZFS snapshots and backups also cover it.
 
@@ -166,7 +168,7 @@ The [Minisforum N5 Pro](https://www.minisforum.com/products/n5-pro) has an **AMD
 370** with two accelerators worth exposing to guests:
 
 | Device | What it is | Host driver | Device node | Userspace |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | **GPU** | Radeon 890M iGPU (RDNA 3.5), AV1 and H.265 encode and decode | `amdgpu` (in Trixie's 6.12) | `/dev/dri/renderD128` | Mesa VAAPI (`vainfo`, `ffmpeg -hwaccel vaapi`) |
 | **NPU** | XDNA2 NPU, ~50 TOPS | `amdxdna` (**Linux 6.14 or later**) | `/dev/accel/accel0` | AMD XRT / Ryzen AI |
 
@@ -208,6 +210,7 @@ incus config device add ai   npu unix-char source=/dev/accel/accel0
 ```
 
 Notes:
+
 - Both accelerators are shared. Several containers, and the host, can use them at the same time.
   There is no exclusive lock.
 - For VAAPI in an unprivileged container, the `gpu` device maps the render node for you. If a
@@ -312,7 +315,7 @@ does not import. Two things keep you safe:
   and ABI updates, such as security fixes, still install, even on a plain `apt upgrade`. Meanwhile
   the file holds back `7.1` and later:
 
-  ```
+  ```none
   Package: linux-image-amd64 linux-headers-amd64
   Pin: version 7.0.*
   Pin-Priority: 1001
@@ -335,13 +338,16 @@ the host, and hands it to one guest exclusively:
 
 1. Enable the IOMMU on the host. Step 0 sets the kernel command line through ZFSBootMenu, so add the
    IOMMU flags there rather than to GRUB:
+
    ```sh
    sudo zfs set org.zfsbootmenu:commandline="quiet loglevel=0 amd_iommu=on iommu=pt" <pool>/ROOT
    sudo generate-zbm && sudo reboot
    ```
+
 2. Find the device and its IOMMU group, with `lspci -nnk`, then
    `ls /sys/kernel/iommu_groups/*/devices/`. Everything in the group moves together.
 3. Bind it to `vfio-pci` and attach it to the VM:
+
    ```sh
    incus config device add v1 gpu gpu gputype=physical pci=0000:c5:00.0   # GPU, by PCI addr
    incus config device add v1 npu pci  address=0000:c5:00.1               # NPU, raw PCI passthrough
