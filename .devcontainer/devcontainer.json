@@ -1,0 +1,68 @@
+{
+  "name": "homelab",
+  "build": { "dockerfile": "Dockerfile" },
+
+  "features": {
+    // Node is what npx-based tooling needs; the claude-code feature would pull it in
+    // anyway, but pin it here so the version is ours rather than incidental.
+    "ghcr.io/devcontainers/features/node:1": { "version": "lts" },
+    // "os-provided" keeps this on Trixie's python3.13 — the same interpreter that
+    // apt's python3-yaml installs into. A separately built Python would not see it.
+    "ghcr.io/devcontainers/features/python:1": { "version": "os-provided" },
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
+  },
+
+  // --- Rootless Podman ---------------------------------------------------------
+  // keep-id maps the container user onto the host UID, so files written under
+  // /workspaces come out owned by you. Without it they land owned by a subuid from
+  // /etc/subuid and the workspace is effectively read-only.
+  "runArgs": ["--userns=keep-id"],
+  "containerUser": "vscode",
+  // Must stay false while keep-id does the mapping: the extension's own chown pass
+  // would otherwise fight it and the container fails to start.
+  "updateRemoteUserUID": false,
+
+  // Named volumes, not bind mounts — the point is that host state stays on the host.
+  // ~/.claude carries the Claude Code credentials, so it must survive a rebuild;
+  // re-authenticating on every image change gets old fast.
+  "mounts": [
+    "source=homelab-claude,target=/home/vscode/.claude,type=volume",
+    "source=homelab-history,target=/commandhistory,type=volume"
+  ],
+
+  "remoteEnv": {
+    "HISTFILE": "/commandhistory/.bash_history",
+    // uv installs itself to ~/.local/bin and edits shell rc files to match, which only
+    // helps login shells. Set it here so every terminal and task sees uv the same way.
+    "PATH": "/home/vscode/.local/bin:${containerEnv:PATH}"
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "anthropic.claude-code",
+        "timonwong.shellcheck",
+        "foxundermoon.shell-format",
+        "mads-hartmann.bash-ide-vscode",
+        "redhat.vscode-yaml",
+        "davidanson.vscode-markdownlint",
+        "eamodio.gitlens"
+      ],
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "editor.formatOnSave": false,
+        "[shellscript]": {
+          "editor.defaultFormatter": "foxundermoon.shell-format"
+        },
+        // The installers are bash, not sh — without this shellcheck reports a pile
+        // of false positives about bashisms.
+        "shellcheck.customArgs": ["--shell=bash", "--external-sources"],
+        "shellformat.flag": "-i 2 -ci",
+        "files.trimTrailingWhitespace": true
+      }
+    }
+  },
+
+  "postCreateCommand": "bash .devcontainer/post-create.sh"
+}
