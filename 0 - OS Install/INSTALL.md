@@ -35,14 +35,18 @@ Push with scp from your workstation:
    its IP (the live user is `user` with the default password `live` — that's
    what the scp below authenticates as; root has no password and can't log in
    over SSH):
+
    ```sh
    sudo apt update && sudo apt install -y openssh-server
    ip -4 addr show                              # note the live session's IP
    ```
+
 2. From your **workstation** (log in as the live user `user`, password `live`):
+
    ```sh
    scp zbm-install.sh ~/.ssh/id_ed25519.pub user@<live-ip>:~/
    ```
+
 3. Back on the target, `ssh user@<live-ip>` or continue on the console —
    the files are now in `/home/user/`. Run the installer from there with
    `sudo ./zbm-install.sh`.
@@ -65,7 +69,7 @@ Push with scp from your workstation:
    replacement). Editing the block just changes those pre-filled defaults.
 
    | Variable | Meaning | Default |
-   |---|---|---|
+   | --- | --- | --- |
    | `TIMEZONE` | System timezone | `Etc/UTC` |
    | `KEYMAP` | Console keymap — installed OS's TTY (written to both `/etc/vconsole.conf` and `/etc/default/keyboard`) *and* baked into the ZFSBootMenu image, so the passphrase prompt matches your physical keyboard. Must be a vconsole keymap name (validated at runtime against `localectl list-keymaps`), e.g. `us`, `dk`, `de`, `uk`; this equals the X11 layout code for most layouts | `dk` |
    | `POOL_NAME` | ZFS pool name | `zroot` |
@@ -159,7 +163,7 @@ You won't invoke this yourself; Stage 1 calls `zbm-install.sh --stage2`
 inside the chroot for you, after recovering the disk list, hostname, admin
 username, network config, and tunable settings Stage 1 recorded.
 
-8. **Phase 8** — sets hostname/hosts, apt sources (main + security +
+1. **Phase 8** — sets hostname/hosts, apt sources (main + security +
    updates), locale, timezone, console keymap (`KEYMAP`, written to
    `/etc/vconsole.conf` and `/etc/default/keyboard`), installs
    `openssh-server`/`sudo`, and configures the installed OS's **static
@@ -169,7 +173,7 @@ username, network config, and tunable settings Stage 1 recorded.
    nameserver). Then creates the admin user and prompts you to **set a
    password** for both the admin user and root (retries on typo instead of
    aborting).
-9. **Phase 9** — installs the Linux kernel and ZFS (DKMS), verifies the ZFS
+2. **Phase 9** — installs the Linux kernel and ZFS (DKMS), verifies the ZFS
    kernel module actually built for the installed kernel, applies the ARC
    cap if set, enables ZFS services, mounts the EFI partition, rebuilds the
    initramfs, and verifies the encryption key made it in. Also installs a
@@ -177,7 +181,7 @@ username, network config, and tunable settings Stage 1 recorded.
    booted root before every `apt` operation and then prunes so only the
    newest 20 `apt_` snapshots remain) — one-reboot undo for package upgrades
    via a ZBM boot environment.
-10. **Phase 10** — builds ZFSBootMenu from source (pinned to `ZBM_VERSION`)
+3. **Phase 10** — builds ZFSBootMenu from source (pinned to `ZBM_VERSION`)
     with the `dracut-crypt-ssh` module (pinned to `CRYPT_SSH_COMMIT`) and
     dracut's `i18n` module (for `KEYMAP`) baked in, generates dedicated
     dropbear host keys, installs your authorized key, writes the ZBM config
@@ -188,7 +192,7 @@ username, network config, and tunable settings Stage 1 recorded.
     `VMLINUZ-BACKUP.EFI` copy and registers **both** primary and backup EFI
     boot entries on **every** disk, plus a kernel postinst hook that rotates
     the backup and rebuilds ZBM on every kernel update.
-11. **Phase 11** — snapshots the freshly-installed root
+4. **Phase 11** — snapshots the freshly-installed root
     (`@base_install`) and clones it into a `_rescue` boot environment,
     selectable from the ZBM menu if the main system ever breaks.
 
@@ -205,12 +209,15 @@ Remove the USB stick and reboot. At boot:
    keyboard before you rely on it — there's no way to change the keymap
    interactively at this prompt.
 2. To unlock remotely instead, SSH into dropbear while ZBM is waiting:
+
    ```sh
    ssh -p <DROPBEAR_PORT> root@<nas-ip>
    ```
+
    then run `zfsbootmenu` (or it may run automatically) and enter the
    passphrase there.
 3. Once the OS has booted, connect normally on port 22:
+
    ```sh
    ssh <admin_user>@<nas-ip>
    ```
