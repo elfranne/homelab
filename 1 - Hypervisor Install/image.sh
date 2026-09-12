@@ -10,6 +10,7 @@
 #
 #   build    <path/to/image.yaml>                         create/refresh the image
 #   deploy   <alias> <instance> [-p profile …] [--volume <pool>/<vol>:<path>]
+#                               [--config <key>=<value> …]
 #   update   <alias> <instance>                           swap rootfs from a new image
 #   destroy  <instance> [--image <alias>] [--volume <pool>/<vol>]
 #   status                                                images / instances / volumes
@@ -19,6 +20,11 @@
 # containers. Persistent state belongs on a --volume, so the image rootfs stays
 # disposable: `update` rebuilds the rootfs from a fresh image via `incus rebuild` while
 # keeping the instance's config and attached volumes.
+#
+# Per-instance settings belong in --config user.* keys rather than in the image: an image
+# is shared by every instance built from it, while `user.*` keys survive a rebuild and can
+# be read back by the Incus templates baked into the image (config_get). That is what lets
+# an updated container regenerate its own configuration without re-running a provisioner.
 #
 # Run as a user in the incus-admin group (or root). Only the distrobuilder build (and,
 # if needed, installing distrobuilder itself) uses sudo.
@@ -117,11 +123,12 @@ cmd_build() {
 
 cmd_deploy() {
   local alias="" instance="" vol_spec=""
-  local -a profiles=()
+  local -a profiles=() configs=()
   while (( $# )); do
     case "$1" in
       -p|--profile) profiles+=("-p" "${2:?profile name}"); shift 2;;
       --volume)     vol_spec="${2:?<pool>/<vol>:<path>}"; shift 2;;
+      --config)     configs+=("-c" "${2:?<key>=<value>}"); shift 2;;
       -*)           die "deploy: unknown option '$1'";;
       *) if   [[ -z "$alias"    ]]; then alias="$1"
          elif [[ -z "$instance" ]]; then instance="$1"
@@ -129,16 +136,23 @@ cmd_deploy() {
     esac
   done
   [[ -n "$alias" && -n "$instance" ]] \
-    || die "usage: image.sh deploy <alias> <instance> [-p profile …] [--volume <pool>/<vol>:<path>]"
+    || die "usage: image.sh deploy <alias> <instance> [-p profile …] [--volume <pool>/<vol>:<path>] [--config <key>=<value> …]"
   need_cmd incus
   image_exists "$alias" || die "No image alias '$alias' — build it first (image.sh build …)."
   (( ${#profiles[@]} )) || profiles=("-p" "default")
 
   if ! ct_exists "$instance"; then
-    incus init "$alias" "$instance" "${profiles[@]}"
+    incus init "$alias" "$instance" "${profiles[@]}" ${configs[@]+"${configs[@]}"}
     ok "Initialised '$instance' from image '$alias'."
   else
     warn "Instance '$instance' already exists — reusing it."
+    # Re-apply the keys on an existing instance too, so deploy stays idempotent and a
+    # changed answer takes effect on the next start (the templates re-render then).
+    local kv
+    for kv in ${configs[@]+"${configs[@]}"}; do
+      [[ "$kv" == "-c" ]] && continue
+      incus config set "$instance" "${kv%%=*}" "${kv#*=}"
+    done
   fi
 
   if [[ -n "$vol_spec" ]]; then
@@ -163,6 +177,15 @@ cmd_update() {
   need_cmd incus
   ct_exists "$instance"  || die "No such instance: '$instance'."
   image_exists "$alias"  || die "No image alias '$alias' — build the new image first."
+
+  # `incus rebuild` refuses outright on an instance that has snapshots. Catch it here so
+  # the reason is obvious, rather than letting the ERR trap print a bare incus failure.
+  # Snapshot the state VOLUME instead — that is where anything worth keeping lives:
+  #   incus storage volume snapshot <pool> <volume>
+  local snaps
+  snaps="$(incus snapshot list "$instance" -f csv 2>/dev/null | wc -l)"
+  (( snaps == 0 )) || die "Instance '$instance' has $snaps snapshot(s); 'incus rebuild' cannot run.
+  Delete them (incus snapshot delete $instance <name>) and snapshot the state volume instead."
 
   ct_running "$instance" && { log "Stopping '$instance'…"; incus stop "$instance"; }
   log "Rebuilding '$instance' rootfs from image '$alias' (config + volumes are kept)…"
