@@ -1,6 +1,12 @@
 {
   "version": 1,
   "skills": {
+    "incus-doc": {
+      "source": "fruafr/skills",
+      "sourceType": "github",
+      "skillPath": "skills/incus-doc/SKILL.md",
+      "computedHash": "5ab7d3a91e94e5811f63455789cc14606e388d91e4a43b098a49b1966c6ef026"
+    },
     "simple-english": {
       "source": "aminblg/simpleenglish",
       "sourceType": "github",

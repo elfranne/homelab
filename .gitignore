@@ -1,0 +1,30 @@
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editor cruft
+*.swp
+*.swo
+*~
+
+# Python (used to validate distrobuilder YAML against its schema)
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Secrets — scripts read these from the environment or prompt for them at
+# runtime; they must never land in the repository (see CLAUDE.md, "Secrets
+# never go into the repository").
+*.env
+.env
+*.token
+*credentials*
+
+# Stray distrobuilder output, if ever built inside the repo by mistake
+# (image.sh normally builds into a throwaway mktemp -d outside the tree)
+*.squashfs
+incus.tar.xz
+
+# Claude Code local settings (personal permission overrides)
+.claude/settings.local.json
